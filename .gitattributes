@@ -1,0 +1,11 @@
+# Keep sources LF on every machine, including Windows runners, so gofmt and diffs are stable.
+* text=auto
+*.go text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.iss text eol=lf
+*.ps1 text eol=lf
+*.ico binary
