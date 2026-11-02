@@ -1,0 +1,29 @@
+name: CI
+
+# Runs on every normal push and pull request. It never publishes anything:
+# releases only happen when a version tag is pushed (see release.yml).
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Format
+        shell: bash
+        run: test -z "$(gofmt -l cmd internal tools)" || (gofmt -l cmd internal tools; exit 1)
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build -o dist/focusguard.exe ./cmd/focusguard

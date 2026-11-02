@@ -4,6 +4,8 @@
 .unlazy/
 .unlazy-hook-state.json
 skills-lock.json
+GATES.md
+devdata/
 
 # build output
 dist/

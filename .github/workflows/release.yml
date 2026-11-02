@@ -1,0 +1,81 @@
+name: Release
+
+# Pushing a tag like v1.2.0 builds the installer, signs its checksums and
+# publishes a GitHub Release. The running app only trusts releases whose
+# SHA256SUMS verifies against the public key built into it.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Manual run: builds and signs everything but publishes nothing (a dry run).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    # Optional: create a GitHub Environment named "release" with a required
+    # reviewer (a parent) so nothing ships without their approval.
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test ./...
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${{ steps.ver.outputs.version }}" -o dist/focusguard.exe ./cmd/focusguard
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --no-progress -y }
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.ver.outputs.version }}" installer\focusguard.iss
+          if (-not (Test-Path "dist\FocusGuard-Setup-${{ steps.ver.outputs.version }}.exe")) { throw "installer was not produced" }
+
+      - name: Checksums and signature
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          cd dist
+          sha256sum "FocusGuard-Setup-${{ steps.ver.outputs.version }}.exe" > SHA256SUMS
+          cd ..
+          go run ./tools/sign RELEASE_SIGNING_KEY dist/SHA256SUMS
+          cat dist/SHA256SUMS
+
+      - name: Keep the files from a dry run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dry-run
+          path: dist/
+          retention-days: 3
+
+      - name: Publish release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/FocusGuard-Setup-${{ steps.ver.outputs.version }}.exe" dist/SHA256SUMS dist/SHA256SUMS.sig \
+            --title "Focus Guard ${{ steps.ver.outputs.version }}" --generate-notes
