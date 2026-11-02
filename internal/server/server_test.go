@@ -1,0 +1,261 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/cookiejar"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Azaxek/focus-blocker/internal/apps"
+	"github.com/Azaxek/focus-blocker/internal/auth"
+	"github.com/Azaxek/focus-blocker/internal/clock"
+	"github.com/Azaxek/focus-blocker/internal/engine"
+	"github.com/Azaxek/focus-blocker/internal/schedule"
+	"github.com/Azaxek/focus-blocker/internal/store"
+)
+
+type nopSites struct{}
+
+func (nopSites) Reconcile([]string, time.Time) ([]string, error) { return nil, nil }
+
+type nopApps struct{}
+
+func (nopApps) SetRules([]apps.Rule) {}
+func (nopApps) Scan() []apps.Killed  { return nil }
+
+func init() { auth.Params.Memory, auth.Params.Time = 8, 1 }
+
+type rig struct {
+	t     *testing.T
+	s     *Server
+	h     http.Handler
+	token string
+	jar   *cookiejar.Jar
+}
+
+func newRig(t *testing.T) *rig {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk := clock.New()
+	s := New("1.0.0")
+	s.Store, s.Eng = st, engine.New("1.0.0", st, clk, nopSites{}, nopApps{})
+	s.Auth = auth.New(filepath.Join(t.TempDir(), "auth.json"), clk.Now)
+	s.Stop = func() {}
+	r := &rig{t: t, s: s, h: s.Handler(), token: s.token}
+	r.jar, _ = cookiejar.New(nil)
+	return r
+}
+
+// do sends a request as the local dashboard page would.
+func (r *rig) do(method, path string, body any, mods ...func(*http.Request)) *httptest.ResponseRecorder {
+	var buf bytes.Buffer
+	if body != nil {
+		json.NewEncoder(&buf).Encode(body)
+	}
+	req := httptest.NewRequest(method, "http://127.0.0.1:47820"+path, &buf)
+	req.Host = "127.0.0.1:47820"
+	req.Header.Set("X-FG-Token", r.token)
+	req.Header.Set("Origin", "http://127.0.0.1:47820")
+	u, _ := url.Parse("http://127.0.0.1:47820/")
+	for _, c := range r.jar.Cookies(u) {
+		req.AddCookie(c)
+	}
+	for _, m := range mods {
+		m(req)
+	}
+	w := httptest.NewRecorder()
+	r.h.ServeHTTP(w, req)
+	r.jar.SetCookies(u, w.Result().Cookies())
+	return w
+}
+
+func code(w *httptest.ResponseRecorder) int { return w.Code }
+
+func (r *rig) setup() {
+	if w := r.do("POST", "/api/auth/setup", map[string]string{"passcode": "parent-secret"}); w.Code != 200 {
+		r.t.Fatalf("setup: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestIndexCarriesFreshTokenAndSecurityHeaders(t *testing.T) {
+	r := newRig(t)
+	w := r.do("GET", "/", nil)
+	m := regexp.MustCompile(`content="([0-9a-f]{48})"`).FindStringSubmatch(w.Body.String())
+	if m == nil || m[1] != r.token {
+		t.Fatalf("token not injected: %s", w.Body)
+	}
+	if New("x").token == r.token {
+		t.Fatal("tokens must be random per run")
+	}
+	for _, h := range []string{"Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options"} {
+		if w.Header().Get(h) == "" {
+			t.Errorf("missing %s", h)
+		}
+	}
+	if !strings.Contains(w.Header().Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Error("CSP must forbid framing")
+	}
+}
+
+func TestHostHeaderAllowList(t *testing.T) {
+	r := newRig(t)
+	for host, want := range map[string]int{"127.0.0.1:47820": 200, "localhost:47820": 200, "evil.com:47820": 403, "127.0.0.1.evil.com:47820": 403, "127.0.0.1:80": 403} {
+		w := r.do("GET", "/api/ping", nil, func(q *http.Request) { q.Host = host })
+		if w.Code != want {
+			t.Errorf("Host %s: got %d want %d", host, w.Code, want)
+		}
+	}
+}
+
+func TestStateChangesNeedTheToken(t *testing.T) {
+	r := newRig(t)
+	no := func(q *http.Request) { q.Header.Del("X-FG-Token") }
+	bad := func(q *http.Request) { q.Header.Set("X-FG-Token", "guess") }
+	for _, m := range []func(*http.Request){no, bad} {
+		for _, p := range []string{"/api/auth/setup", "/api/auth/login", "/api/uninstall/request"} {
+			if w := r.do("POST", p, map[string]string{"passcode": "x"}, m); w.Code != 403 {
+				t.Errorf("%s without a valid token: %d", p, w.Code)
+			}
+		}
+	}
+}
+
+func TestCrossOriginRequestsRefused(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	cases := []func(*http.Request){
+		func(q *http.Request) { q.Header.Set("Origin", "https://evil.example") },
+		func(q *http.Request) { q.Header.Set("Origin", "null") },
+		func(q *http.Request) { q.Header.Set("Sec-Fetch-Site", "cross-site") },
+	}
+	for i, m := range cases {
+		if w := r.do("POST", "/api/auth/login", map[string]string{"passcode": "parent-secret"}, m); w.Code != 403 {
+			t.Errorf("case %d: %d", i, w.Code)
+		}
+	}
+}
+
+func TestFirstRunSetupOnlyOnce(t *testing.T) {
+	r := newRig(t)
+	if w := r.do("POST", "/api/auth/setup", map[string]string{"passcode": "short"}); w.Code != 400 {
+		t.Fatalf("short passcode: %d", w.Code)
+	}
+	r.setup()
+	if w := r.do("POST", "/api/auth/setup", map[string]string{"passcode": "another-one"}); w.Code != 409 {
+		t.Fatalf("second setup must be refused: %d", w.Code)
+	}
+}
+
+func TestEditsNeedAPasscodeSession(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	r.do("POST", "/api/auth/logout", nil)
+	cfg := r.s.Store.Config()
+	for _, c := range []struct{ m, p string }{{"PUT", "/api/config"}, {"GET", "/api/log"}, {"GET", "/api/updates"}, {"POST", "/api/windows/end"}, {"POST", "/api/service/stop"}, {"POST", "/api/auth/change"}, {"PUT", "/api/updates/settings"}} {
+		if w := r.do(c.m, c.p, cfg); w.Code != 401 {
+			t.Errorf("%s %s without a session: %d", c.m, c.p, w.Code)
+		}
+	}
+	if w := r.do("POST", "/api/auth/login", map[string]string{"passcode": "parent-secret"}); w.Code != 200 {
+		t.Fatal(w.Body)
+	}
+	u, _ := url.Parse("http://127.0.0.1:47820/")
+	ck := r.jar.Cookies(u)
+	if len(ck) != 1 {
+		t.Fatal("no session cookie")
+	}
+	cfg.Windows = []schedule.Window{{ID: "w", Name: "School", Days: []int{1}, Start: "15:30", End: "21:00"}}
+	if w := r.do("PUT", "/api/config", cfg); w.Code != 200 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if len(r.s.Store.Config().Windows) != 1 {
+		t.Fatal("edit not saved")
+	}
+	if w := r.do("GET", "/api/log", nil); w.Code != 200 {
+		t.Fatal("log should be readable with a session")
+	}
+}
+
+func TestSessionCookieFlags(t *testing.T) {
+	r := newRig(t)
+	w := r.do("POST", "/api/auth/setup", map[string]string{"passcode": "parent-secret"})
+	c := w.Result().Cookies()
+	if len(c) != 1 || !c[0].HttpOnly || c[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cookie: %+v", c)
+	}
+}
+
+func TestLockoutOverHTTP(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	r.do("POST", "/api/auth/logout", nil)
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 5; i++ {
+		last = r.do("POST", "/api/auth/login", map[string]string{"passcode": "wrong-guess"})
+	}
+	if last.Code != 429 {
+		t.Fatalf("5th wrong attempt should lock: %d %s", last.Code, last.Body)
+	}
+	if w := r.do("POST", "/api/auth/login", map[string]string{"passcode": "parent-secret"}); w.Code != 429 {
+		t.Fatalf("correct passcode must not work while locked: %d", w.Code)
+	}
+	if strings.Contains(r.s.Store.ReadLog(1)[0].Msg, "wrong-guess") {
+		t.Fatal("passcode leaked into the log")
+	}
+}
+
+func TestEndingEarlyAsksForPasscodeAgain(t *testing.T) {
+	r := newRig(t)
+	r.setup() // session exists
+	if w := r.do("POST", "/api/windows/end", map[string]string{"key": "x", "passcode": "wrong-guess"}); w.Code != 403 {
+		t.Fatalf("a live session alone must not be enough: %d", w.Code)
+	}
+	if w := r.do("POST", "/api/windows/end", map[string]string{"key": "nope", "passcode": "parent-secret"}); w.Code != 400 {
+		t.Fatalf("right passcode, unknown window: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestPublicEndpointsExposeNoSecrets(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	r.do("POST", "/api/auth/logout", nil)
+	for _, p := range []string{"/api/status", "/api/ping", "/api/config", "/api/events"} {
+		w := r.do("GET", p, nil, func(q *http.Request) { q.Header.Del("X-FG-Token") })
+		if w.Code != 200 {
+			t.Errorf("%s: %d", p, w.Code)
+		}
+		if strings.Contains(w.Body.String(), "argon2") || strings.Contains(w.Body.String(), "parent-secret") {
+			t.Errorf("%s leaks secrets", p)
+		}
+	}
+}
+
+func TestUninstallNeedsApproval(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	check := func() bool {
+		w := r.do("GET", "/api/uninstall/status", nil)
+		var o map[string]bool
+		json.Unmarshal(w.Body.Bytes(), &o)
+		return o["approved"]
+	}
+	r.do("POST", "/api/uninstall/request", nil)
+	if check() {
+		t.Fatal("approved without a passcode")
+	}
+	if w := r.do("POST", "/api/uninstall/approve", map[string]string{"passcode": "nope-nope"}); w.Code != 403 || check() {
+		t.Fatal("wrong passcode approved the uninstall")
+	}
+	if w := r.do("POST", "/api/uninstall/approve", map[string]string{"passcode": "parent-secret"}); w.Code != 200 || !check() {
+		t.Fatal("right passcode should approve")
+	}
+}
