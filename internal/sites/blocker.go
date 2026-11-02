@@ -74,7 +74,7 @@ func (b *Blocker) verify(domains []string) (bad []string) {
 	if !hostsIntact(b.hosts, domains) {
 		bad = append(bad, "hosts")
 	}
-	if !policiesOK() {
+	if !policiesOK() || !windowPoliciesOK() {
 		bad = append(bad, "policy")
 	}
 	if countFirewallRules() < firewallRuleCount {
@@ -94,7 +94,7 @@ func (b *Blocker) fix(domains []string, parts ...string) error {
 		case "hosts":
 			errs = append(errs, writeHosts(b.hosts, domains))
 		case "policy":
-			errs = append(errs, setPolicies())
+			errs = append(errs, setPolicies(), setWindowPolicies())
 		case "nrpt":
 			script += nrptScript(domains)
 		case "firewall":
@@ -114,9 +114,11 @@ func (b *Blocker) fix(domains []string, parts ...string) error {
 	return errors.Join(errs...)
 }
 
-// clear removes every per-window rule (browser policies stay: they are harmless and permanent).
+// clear removes every per-window rule, including the "connect directly" browser
+// policy. The permanent policies (encrypted DNS and QUIC off) stay: they are harmless.
 func (b *Blocker) clear() error {
 	b.Sink.Stop()
+	removeWindowPolicies()
 	err := writeHosts(b.hosts, nil)
 	if b.scriptFailed && time.Since(b.scriptAt) < 30*time.Second {
 		return errors.Join(err, errors.New("waiting to retry removing the DNS/firewall rules"))
@@ -136,6 +138,7 @@ func (b *Blocker) Uninstall() error {
 	defer b.mu.Unlock()
 	err := b.clear()
 	removePolicies()
+	removeWindowPolicies()
 	b.applied = ""
 	return err
 }

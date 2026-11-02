@@ -145,6 +145,51 @@ func TestPoliciesRoundTrip(t *testing.T) {
 	}
 }
 
+// Proxies (such as a VPN browser extension) resolve names remotely and would
+// walk around the block, so a window forces direct connections and the policy
+// disappears again afterwards.
+func TestWindowPoliciesForceDirectConnectionsAndAreRemoved(t *testing.T) {
+	root, base := polRoot, polBase
+	defer func() { polRoot, polBase = root, base }()
+	polRoot, polBase = registry.CURRENT_USER, `Software\FocusGuardTest2`
+	defer registry.DeleteKey(registry.CURRENT_USER, `Software\FocusGuardTest2`)
+
+	if windowPoliciesOK() {
+		t.Fatal("should start unset")
+	}
+	if err := setWindowPolicies(); err != nil || !windowPoliciesOK() {
+		t.Fatalf("set: %v", err)
+	}
+	for _, key := range []string{`Google\Chrome`, `Microsoft\Edge`} {
+		k, err := registry.OpenKey(polRoot, polBase+`\`+key, registry.QUERY_VALUE)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v, _, _ := k.GetStringValue("ProxyMode"); v != "direct" {
+			t.Errorf("%s ProxyMode = %q", key, v)
+		}
+		k.Close()
+	}
+	k, _ := registry.OpenKey(polRoot, polBase+`\Google\Chrome`, registry.SET_VALUE)
+	k.SetStringValue("ProxyMode", "system") // user switches the proxy back on
+	k.Close()
+	if windowPoliciesOK() {
+		t.Fatal("tamper not detected")
+	}
+	setWindowPolicies()
+	removeWindowPolicies()
+	if windowPoliciesOK() {
+		t.Fatal("not removed")
+	}
+	// the permanent policies are separate and untouched by removing the window ones
+	setPolicies()
+	removeWindowPolicies()
+	if !policiesOK() {
+		t.Fatal("removing window policies must not remove the permanent ones")
+	}
+	removePolicies()
+}
+
 func TestSinkholeDNSAnswers(t *testing.T) {
 	s := NewSinkhole()
 	var counted []string

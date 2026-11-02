@@ -16,6 +16,8 @@ if (-not $id.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 $root = Split-Path $PSScriptRoot -Parent
 $dest = Join-Path $env:ProgramFiles 'FocusGuard'
 New-Item -ItemType Directory -Force $dest | Out-Null
+# re-running over an existing install: stop the service so the exe can be replaced
+if (Test-Path (Join-Path $dest 'focusguard.exe')) { & (Join-Path $dest 'focusguard.exe') stop-service }
 Push-Location $root
 try {
     & $Go build -trimpath -ldflags "-X main.version=0.0.1-dev" -o (Join-Path $dest 'focusguard.exe') ./cmd/focusguard

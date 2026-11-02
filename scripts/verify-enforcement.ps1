@@ -35,6 +35,10 @@ try {
 } catch { Write-Host "  SKIP  DNS (NRPT) rule check needs an administrator shell" -ForegroundColor Yellow }
 $pol = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Edge' -ErrorAction SilentlyContinue).DnsOverHttpsMode
 Check "Edge DNS-over-HTTPS policy is 'off'" ($pol -eq 'off')
+foreach ($b in 'Google\Chrome', 'Microsoft\Edge') {
+    $pm = (Get-ItemProperty "HKLM:\SOFTWARE\Policies\$b" -ErrorAction SilentlyContinue).ProxyMode
+    Check "$b is forced to connect directly (no proxy / VPN extension) = $blocking  (ProxyMode: '$pm')" (($pm -eq 'direct') -eq $blocking)
+}
 
 if ($blocking) {
     Write-Host "`nNow open each blocked site in Chrome AND Edge: expect a connection error or the Stay-with-it page."

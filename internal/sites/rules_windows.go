@@ -155,8 +155,8 @@ var policies = func() []polValue {
 		polValue{key: `Mozilla\Firefox\DNSOverHTTPS`, name: "Locked", dword: 1})
 }()
 
-func setPolicies() error {
-	for _, p := range policies {
+func setPolicyList(list []polValue) error {
+	for _, p := range list {
 		k, _, err := registry.CreateKey(polRoot, polBase+`\`+p.key, registry.SET_VALUE)
 		if err != nil {
 			return err
@@ -174,8 +174,8 @@ func setPolicies() error {
 	return nil
 }
 
-func policiesOK() bool {
-	for _, p := range policies {
+func policyListOK(list []polValue) bool {
+	for _, p := range list {
 		k, err := registry.OpenKey(polRoot, polBase+`\`+p.key, registry.QUERY_VALUE)
 		if err != nil {
 			return false
@@ -196,11 +196,34 @@ func policiesOK() bool {
 	return true
 }
 
-func removePolicies() {
-	for _, p := range policies {
+func removePolicyList(list []polValue) {
+	for _, p := range list {
 		if k, err := registry.OpenKey(polRoot, polBase+`\`+p.key, registry.SET_VALUE); err == nil {
 			k.DeleteValue(p.name)
 			k.Close()
 		}
 	}
 }
+
+func setPolicies() error { return setPolicyList(policies) }
+func policiesOK() bool   { return policyListOK(policies) }
+func removePolicies()    { removePolicyList(policies) }
+
+// While a window is active the browsers are told to connect directly. A proxy
+// (a proxy extension such as a VPN add-on, or a system proxy) resolves names on
+// its own side and walks straight around hosts, DNS and the sinkhole. A proxy
+// mode set by policy also stops extensions from changing it. These values exist
+// only during a window; afterwards the browsers go back to the user's own setting.
+var windowPolicies = func() []polValue {
+	var p []polValue
+	for _, k := range []string{`Google\Chrome`, `Microsoft\Edge`, `BraveSoftware\Brave`} {
+		p = append(p, polValue{key: k, name: "ProxyMode", str: "direct", isStr: true})
+	}
+	return append(p,
+		polValue{key: `Mozilla\Firefox\Proxy`, name: "Mode", str: "none", isStr: true},
+		polValue{key: `Mozilla\Firefox\Proxy`, name: "Locked", dword: 1})
+}()
+
+func setWindowPolicies() error { return setPolicyList(windowPolicies) }
+func windowPoliciesOK() bool   { return policyListOK(windowPolicies) }
+func removeWindowPolicies()    { removePolicyList(windowPolicies) }
