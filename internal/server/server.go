@@ -37,10 +37,10 @@ import (
 	"github.com/Azaxek/focus-blocker/internal/updater"
 )
 
-const (
-	Port       = 47820
-	sessionTTL = 10 * time.Minute
-)
+const sessionTTL = 10 * time.Minute
+
+// Port is the loopback port of the dashboard. Only `focusguard run --port` (development) changes it.
+var Port = 47820
 
 //go:embed web
 var webFS embed.FS
@@ -81,7 +81,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Write(bytes.ReplaceAll(index, []byte("__FG_TOKEN__"), []byte(s.token)))
+		// the first paint needs no round trip: status and config ride inside the page
+		boot, _ := json.Marshal(map[string]any{"s": s.statusPayload(r), "c": s.configPayload()})
+		boot = bytes.ReplaceAll(boot, []byte("</"), []byte(`<\/`))
+		page := bytes.ReplaceAll(index, []byte("__FG_TOKEN__"), []byte(s.token))
+		w.Write(bytes.ReplaceAll(page, []byte("__FG_BOOT__"), boot))
 	})
 	mux.Handle("GET /static/", http.StripPrefix("/static/", static))
 
@@ -105,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	secure("GET /api/log", s.getLog)
 	secure("GET /api/updates", s.getUpdates)
 	secure("POST /api/updates/check", s.checkUpdates)
+	secure("POST /api/updates/install", s.installUpdate)
 	secure("PUT /api/updates/settings", s.putUpdateSettings)
 	secure("GET /api/processes", s.processes)
 	secure("POST /api/service/stop", s.stopService)
@@ -269,19 +274,25 @@ func (s *Server) ping(w http.ResponseWriter, r *http.Request) {
 	send(w, map[string]any{"ok": true, "app": "focusguard", "version": s.Version, "uptime": int(time.Since(s.started).Seconds())})
 }
 
-func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+func (s *Server) statusPayload(r *http.Request) map[string]any {
 	st := s.Eng.Status()
 	s.mu.Lock()
 	pending := s.uninstall.pending
 	s.mu.Unlock()
-	send(w, map[string]any{
+	return map[string]any{
 		"status":           st,
 		"setup":            s.Auth.IsSet(),
 		"lockedUntil":      nullTime(s.Auth.LockedUntil()),
 		"unlocked":         s.hasSession(r),
 		"uninstallPending": pending,
 		"updateReady":      s.updateReady(),
-	})
+	}
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request) { send(w, s.statusPayload(r)) }
+
+func (s *Server) configPayload() map[string]any {
+	return map[string]any{"config": s.Store.Config(), "sitePresets": store.SitePresets, "categoryOrder": store.CategoryOrder, "appPresets": apps.Presets}
 }
 
 func (s *Server) updateReady() string {
@@ -298,10 +309,7 @@ func nullTime(t time.Time) *time.Time {
 	return &t
 }
 
-func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
-	ap := apps.Presets
-	send(w, map[string]any{"config": s.Store.Config(), "sitePresets": store.SitePresets, "categoryOrder": store.CategoryOrder, "appPresets": ap})
-}
+func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) { send(w, s.configPayload()) }
 
 func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 	var c store.Config
@@ -428,6 +436,23 @@ func (s *Server) checkUpdates(w http.ResponseWriter, r *http.Request) {
 	msg, err := s.Upd.CheckNow(ctx)
 	if err != nil {
 		fail(w, http.StatusBadGateway, msg, "update")
+		return
+	}
+	send(w, map[string]string{"result": msg})
+}
+
+// installUpdate downloads (if needed) and installs the newest release right away,
+// but only when no focus window is active or about to start.
+func (s *Server) installUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.Upd == nil {
+		fail(w, http.StatusNotImplemented, "updates are not available in this build", "invalid")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	msg, err := s.Upd.InstallNow(ctx)
+	if err != nil {
+		fail(w, http.StatusConflict, err.Error(), "update")
 		return
 	}
 	send(w, map[string]string{"result": msg})

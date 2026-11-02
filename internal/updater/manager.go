@@ -8,7 +8,7 @@ import (
 )
 
 // CheckEvery is the automatic check interval.
-const CheckEvery = 4 * time.Hour
+const CheckEvery = time.Hour
 
 // Manager runs the check / download / apply cycle inside the service.
 type Manager struct {
@@ -69,9 +69,41 @@ func (m *Manager) CheckNow(ctx context.Context) (string, error) {
 	return msg, err
 }
 
+// InstallNow checks, downloads and installs immediately, unless a focus window
+// is active or about to start (an update never opens a protection gap).
+func (m *Manager) InstallNow(ctx context.Context) (string, error) {
+	if m.Ready() == "" {
+		if _, err := m.CheckNow(ctx); err != nil {
+			return "", err
+		}
+	}
+	m.mu.Lock()
+	rel, path, busy := m.ready, m.path, m.applying
+	m.mu.Unlock()
+	switch {
+	case rel == nil:
+		return "Already up to date (" + m.U.Current + ")", nil
+	case busy:
+		return "Version " + rel.Version + " is already installing", nil
+	case !m.Idle():
+		return "", fmt.Errorf("version %s is ready, but a focus window is active or about to start; it installs by itself when the window ends", rel.Version)
+	}
+	m.mu.Lock()
+	m.applying = true
+	m.mu.Unlock()
+	m.Log("update", "Installing version "+rel.Version+" (requested by a parent)")
+	if err := m.Apply(path, rel); err != nil {
+		m.mu.Lock()
+		m.applying = false
+		m.mu.Unlock()
+		return "", err
+	}
+	return "Installing version " + rel.Version + ". The service restarts for a few seconds.", nil
+}
+
 // Run checks on a schedule and applies a staged update as soon as it is safe.
 func (m *Manager) Run(ctx context.Context) {
-	next := time.Now().Add(90 * time.Second)
+	next := time.Now().Add(20 * time.Second)
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {

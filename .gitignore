@@ -12,3 +12,4 @@ dist/
 build/
 node_modules/
 *.exe
+.taste-skill/

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/Azaxek/focus-blocker/internal/server"
 	"github.com/Azaxek/focus-blocker/internal/sites"
 	"github.com/Azaxek/focus-blocker/internal/tray"
+	"github.com/Azaxek/focus-blocker/internal/updater"
 	"github.com/Azaxek/focus-blocker/internal/winsvc"
 )
 
@@ -75,6 +77,8 @@ func main() {
 		err = authorizeUninstall()
 	case "apply-update":
 		err = applyUpdate(os.Args[2:])
+	case "update-now":
+		err = updateNow(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
@@ -98,7 +102,9 @@ func runConsole(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	dry := fs.Bool("dry", false, "do not change hosts, firewall, DNS or kill processes (UI development)")
 	data := fs.String("data", "", "data directory (default %ProgramData%\\FocusGuard)")
+	port := fs.Int("port", server.Port, "dashboard port (development only: the installed service always uses the default)")
 	fs.Parse(args)
+	server.Port = *port
 	if *data != "" {
 		os.Setenv("FOCUSGUARD_DATA", *data)
 	}
@@ -169,6 +175,53 @@ func authorizeUninstall() error {
 		}
 	}
 	return fmt.Errorf("the parent passcode was not entered")
+}
+
+// updateNow (administrator PowerShell) pulls the newest signed release from GitHub and installs it,
+// with the same checks and rollback as the automatic updater. It refuses during a focus window.
+func updateNow(args []string) error {
+	fs := flag.NewFlagSet("update-now", flag.ExitOnError)
+	force := fs.Bool("force", false, "install even while a focus window is active")
+	fs.Parse(args)
+	if pubKey() == nil || version == "dev" {
+		return fmt.Errorf("this build cannot update itself (version %q)", version)
+	}
+	if !*force {
+		c := &http.Client{Timeout: 3 * time.Second}
+		if resp, err := c.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", server.Port)); err == nil {
+			var st struct{ Status struct{ Blocking bool } }
+			json.NewDecoder(resp.Body).Decode(&st)
+			resp.Body.Close()
+			if st.Status.Blocking {
+				return fmt.Errorf("a focus window is active; wait for it to end or use --force")
+			}
+		}
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	u := &updater.Updater{Repo: repo, PubKey: pubKey(), Current: version, Dir: filepath.Join(app.DataDir(), "updates")}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	rel, err := u.Check(ctx)
+	if err != nil {
+		return err
+	}
+	if rel == nil {
+		fmt.Println("Already up to date (" + version + ")")
+		return nil
+	}
+	fmt.Println("Downloading and verifying version", rel.Version, "...")
+	path, err := u.Download(ctx, rel)
+	if err != nil {
+		return err
+	}
+	if err := app.LaunchUpdateHelper(exe, path, version, rel.Version, app.DataDir()); err != nil {
+		return err
+	}
+	fmt.Println("Installing version", rel.Version, "in the background. The service restarts for a few seconds; the result is in Parent area > Updates.")
+	return nil
 }
 
 func applyUpdate(args []string) error {

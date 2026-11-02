@@ -309,6 +309,38 @@ func snapshot(t *testing.T, dir string) string {
 	return strings.Join(out, ";")
 }
 
+func TestInstallNowWaitsForFreeTimeThenInstalls(t *testing.T) {
+	f := newFixture(t)
+	idle, applied := false, 0
+	m := &Manager{U: f.u, Auto: func() bool { return true }, Idle: func() bool { return idle },
+		Apply: func(string, *Release) error { applied++; return nil }, Log: func(string, string) {}, Record: func(time.Time, string) {}}
+
+	if _, err := m.InstallNow(context.Background()); err == nil || !strings.Contains(err.Error(), "focus window") || applied != 0 {
+		t.Fatalf("must not install during a window: err=%v applied=%d", err, applied)
+	}
+	if m.Ready() != "1.3.0" {
+		t.Fatal("the update should be downloaded and waiting")
+	}
+	idle = true
+	msg, err := m.InstallNow(context.Background())
+	if err != nil || applied != 1 || !strings.Contains(msg, "1.3.0") {
+		t.Fatalf("msg=%q err=%v applied=%d", msg, err, applied)
+	}
+	if msg, _ = m.InstallNow(context.Background()); applied != 1 || !strings.Contains(msg, "already installing") {
+		t.Fatalf("a second click must not start a second install: %q applied=%d", msg, applied)
+	}
+}
+
+func TestInstallNowWhenUpToDate(t *testing.T) {
+	f := newFixture(t)
+	f.u.Current = "1.3.0"
+	m := &Manager{U: f.u, Idle: func() bool { return true }, Apply: func(string, *Release) error { t.Fatal("nothing to install"); return nil },
+		Log: func(string, string) {}, Record: func(time.Time, string) {}}
+	if msg, err := m.InstallNow(context.Background()); err != nil || !strings.Contains(msg, "up to date") {
+		t.Fatalf("%q %v", msg, err)
+	}
+}
+
 func TestResultFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	if ConsumeResult(dir) != nil {

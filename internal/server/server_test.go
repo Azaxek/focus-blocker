@@ -106,6 +106,35 @@ func TestIndexCarriesFreshTokenAndSecurityHeaders(t *testing.T) {
 	}
 }
 
+// The first paint must not wait for any request: status and config ride inside the page.
+func TestIndexInlinesFirstPaintData(t *testing.T) {
+	r := newRig(t)
+	body := r.do("GET", "/", nil).Body.String()
+	m := regexp.MustCompile(`(?s)<script id="boot" type="application/json">(.*?)</script>`).FindStringSubmatch(body)
+	if m == nil {
+		t.Fatal("no boot data in the page")
+	}
+	var boot struct {
+		S struct {
+			Status struct{ Version string }
+			Setup  bool
+		}
+		C struct{ Config struct{ Sites []string } }
+	}
+	if err := json.Unmarshal([]byte(m[1]), &boot); err != nil {
+		t.Fatalf("boot data is not valid JSON: %v", err)
+	}
+	if boot.S.Status.Version != "1.0.0" || len(boot.C.Config.Sites) == 0 || boot.S.Setup {
+		t.Fatalf("unexpected boot data: %+v", boot)
+	}
+	if strings.Contains(m[1], "</") {
+		t.Fatal("boot JSON could close its own script tag")
+	}
+	if strings.Contains(body, "__FG_BOOT__") || strings.Contains(body, "__FG_TOKEN__") {
+		t.Fatal("placeholders were not replaced")
+	}
+}
+
 func TestHostHeaderAllowList(t *testing.T) {
 	r := newRig(t)
 	for host, want := range map[string]int{"127.0.0.1:47820": 200, "localhost:47820": 200, "evil.com:47820": 403, "127.0.0.1.evil.com:47820": 403, "127.0.0.1:80": 403} {

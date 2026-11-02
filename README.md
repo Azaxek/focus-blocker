@@ -55,22 +55,26 @@ The lock is only as strong as the account it runs under. Windows lets an adminis
 - **Block lists:** category presets (Video, Social, Streaming, Chat, Gaming), search, add/remove sites; apps from presets, from a list of running programs, or by file name.
 - **Parent area:** activity log (window start/end, blocked attempts, tamper events, update history), update settings, change passcode, stop the service.
 
+The interface follows the flat "true-black" app style from the taste-skill design guide (no gradients, glows or borders on cards, one data colour, light and dark themes). It never waits on the network: every edit changes the screen first and saves in the background, and a save the service rejects is rolled back with a message. The first screen needs no request at all, because status and settings are embedded in the page.
+
 The dashboard is a local web page served by the service. It binds to `127.0.0.1` only, checks the `Host` header (DNS-rebinding defence), requires a per-run token on every call (CSRF), checks `Origin`, and needs a passcode session cookie (HttpOnly, SameSite=Strict, 10 minute idle) for anything sensitive. Risky actions (ending a window, stopping the service) ask for the passcode again.
 
 ## Releasing an update
 
 Regular commits never publish anything: pushing to any branch only runs `CI` (format, vet, tests, build). A release is published **only** when you push a version tag:
 
-```bash
-git tag v1.2.0
-git push origin v1.2.0
+```powershell
+scripts\release.ps1 -Version 1.2.0          # tests, tags v1.2.0, pushes, waits for the build, prints the release URL
+scripts\release.ps1 -Version 1.2.0 -DryRun  # same checks + a build/sign run on GitHub that publishes nothing
 ```
+
+(That is the same as `git tag v1.2.0` and `git push origin v1.2.0`; the script just checks first and waits for the result.) To pull a release onto **this** PC immediately instead of waiting, run `scripts\update-now.ps1` in an administrator PowerShell, or press **Install latest now** in *Parent area > Updates* (needs the passcode). Both refuse to restart the service during a focus window.
 
 The `Release` workflow then runs the tests, builds `focusguard.exe` with the version baked in, builds `FocusGuard-Setup-1.2.0.exe` with Inno Setup, writes `SHA256SUMS`, signs it with the Ed25519 key in the `RELEASE_SIGNING_KEY` secret, and creates the GitHub Release with three files: the installer, `SHA256SUMS` and `SHA256SUMS.sig`. Run **Actions > Release > Run workflow** for a dry run that builds and signs everything but publishes nothing.
 
 Installed copies:
 
-- check the latest release at startup (after about 90 seconds) and every 4 hours, **only** from `Azaxek/focus-blocker` (compiled in, not configurable), over HTTPS, following redirects only to GitHub hosts;
+- check the latest release shortly after startup (about 20 seconds) and then every hour, **only** from `Azaxek/focus-blocker` (compiled in, not configurable), over HTTPS, following redirects only to GitHub hosts;
 - refuse anything that is not a strictly newer `vX.Y.Z` (no downgrades, no prereleases);
 - verify the Ed25519 signature on `SHA256SUMS` against the public key built into the program, then the installer's SHA-256 against it, **before** running anything;
 - install silently, but **only when no focus window is active and none starts within 5 minutes**, so there is no gap in protection. A ready update simply waits;
@@ -87,7 +91,8 @@ Installed copies:
 
 ```powershell
 go test ./...                              # everything below runs without administrator rights
-go run ./cmd/focusguard run --dry --data .\devdata     # dashboard on http://127.0.0.1:47820, touches nothing on the PC
+go run ./cmd/focusguard run --dry --data .\devdata --port 47899   # dashboard on http://127.0.0.1:47899, touches nothing on the PC
+                                           # (use --port when the real service is already running on 47820)
 scripts\dev-install.ps1                    # (admin) build + install the real service from this tree
 scripts\verify-enforcement.ps1 -Expect Blocking        # during a window, from a normal shell
 scripts\dev-uninstall.ps1                  # (admin) remove everything the dev install added
