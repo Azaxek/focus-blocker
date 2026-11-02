@@ -16,8 +16,9 @@ import (
 func TestSinkholeOnRealPorts(t *testing.T) {
 	s := NewSinkhole()
 	s.Set([]string{"youtube.com"}, time.Date(2026, 5, 4, 21, 0, 0, 0, time.Local))
-	if err := s.Start(); err != nil && !s.Running() {
-		t.Skip("cannot bind port 53 here: ", err)
+	startErr := s.Start()
+	if !s.Running() {
+		t.Skip("cannot bind port 53 here: ", startErr)
 	}
 	defer s.Stop()
 
@@ -26,6 +27,9 @@ func TestSinkholeOnRealPorts(t *testing.T) {
 	r, _, err := new(dns.Client).Exchange(m, "127.0.0.1:53")
 	if err != nil || len(r.Answer) != 1 || !r.Answer[0].(*dns.A).A.Equal(net.IPv4(127, 0, 0, 1)) {
 		t.Fatalf("dns: %v %v", r, err)
+	}
+	if startErr != nil && strings.Contains(startErr.Error(), "block page") {
+		t.Skip("port 80 is taken by another program here (for example IIS), so the block page cannot be served: ", startErr)
 	}
 	req, _ := http.NewRequest("GET", "http://127.0.0.1:80/watch?v=1", nil)
 	req.Host = "www.youtube.com"

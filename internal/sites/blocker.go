@@ -52,8 +52,8 @@ func (b *Blocker) Reconcile(domains []string, until time.Time) (repaired []strin
 	}
 	var errs []error
 	if !b.Sink.Running() {
-		if e := b.Sink.Start(); e != nil && !b.Sink.Running() {
-			errs = append(errs, e) // hosts + firewall + policies still protect without it
+		if e := b.Sink.Start(); e != nil {
+			errs = append(errs, e) // reported once; hosts + firewall + policies still protect without it
 		}
 	}
 	if b.applied != fp {
