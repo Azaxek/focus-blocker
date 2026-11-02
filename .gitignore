@@ -1,0 +1,12 @@
+# local tooling and coordination state
+.claude/
+.agents/
+.unlazy/
+.unlazy-hook-state.json
+skills-lock.json
+
+# build output
+dist/
+build/
+node_modules/
+*.exe
