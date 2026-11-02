@@ -76,6 +76,24 @@ func TestHostsMergeIsIdempotentAndPreservesOtherLines(t *testing.T) {
 	}
 }
 
+func TestHostsCleanupSurvivesDeletedMarkers(t *testing.T) {
+	orig := "127.0.0.1 localhost\r\n"
+	d := []string{"youtube.com", "tiktok.com"}
+	tampered := strings.NewReplacer(hostsBegin+"\r\n", "", hostsEnd+"\r\n", "").Replace(mergeHosts(orig, d))
+	if strings.Contains(tampered, "BEGIN") || !strings.Contains(tampered, "youtube.com") {
+		t.Fatal("test setup wrong")
+	}
+	if hostsOK(tampered, d) {
+		t.Fatal("deleting the markers must count as tampering")
+	}
+	if got := mergeHosts(tampered, d); got != mergeHosts(orig, d) {
+		t.Fatalf("repair left stray or duplicate lines:\n%q", got)
+	}
+	if got := mergeHosts(tampered, nil); got != orig {
+		t.Fatalf("clear left lines behind:\n%q", got)
+	}
+}
+
 func TestWriteHostsRestoresTamperedFile(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "hosts")
 	os.WriteFile(p, []byte("127.0.0.1 localhost\r\n"), 0o644)

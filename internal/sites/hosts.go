@@ -9,6 +9,7 @@ import (
 const (
 	hostsBegin = "# BEGIN FOCUSGUARD (managed block, do not edit)"
 	hostsEnd   = "# END FOCUSGUARD"
+	hostsTag   = " # FOCUSGUARD"
 )
 
 // HostsPath is the Windows hosts file.
@@ -25,8 +26,9 @@ func hostsBlock(domains []string) string {
 	b.WriteString(hostsBegin + "\r\n")
 	for _, d := range domains {
 		for _, h := range []string{d, "www." + d} {
-			b.WriteString("127.0.0.1 " + h + "\r\n")
-			b.WriteString("::1 " + h + "\r\n")
+			// every line carries the tag, so cleanup still finds them if someone deletes the BEGIN/END markers
+			b.WriteString("127.0.0.1 " + h + hostsTag + "\r\n")
+			b.WriteString("::1 " + h + hostsTag + "\r\n")
 		}
 	}
 	b.WriteString(hostsEnd + "\r\n")
@@ -44,6 +46,8 @@ func stripHosts(content string) string {
 			skip = true
 		case t == hostsEnd:
 			skip = false
+		case strings.HasSuffix(t, hostsTag):
+			// a managed line outside the markers (markers were removed): drop it too
 		case !skip:
 			out = append(out, ln)
 		}
