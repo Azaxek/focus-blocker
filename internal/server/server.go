@@ -103,6 +103,10 @@ func (s *Server) Handler() http.Handler {
 	guarded("POST /api/uninstall/request", s.uninstallRequest)
 	guarded("POST /api/uninstall/approve", s.uninstallApprove)
 	guarded("GET /api/uninstall/status", s.uninstallStatus)
+	guarded("POST /api/rewards/redeem", s.redeemReward) // the child spends earned time: no passcode by design
+	guarded("POST /api/rewards/end", s.endBreak)        // ending a break only makes things stricter
+	secure("POST /api/rewards/grant", s.grantReward)    // and the parent re-enters the passcode for every grant
+	secure("POST /api/rewards/revoke", s.revokeReward)
 	secure("PUT /api/config", s.putConfig)
 	secure("POST /api/auth/change", s.changePass)
 	secure("POST /api/windows/end", s.endWindow)
@@ -172,7 +176,15 @@ func (s *Server) newSession(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{Name: "fg_session", Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: int(sessionTTL.Seconds())})
 }
 
-func (s *Server) hasSession(r *http.Request) bool {
+// hasSession reports whether the request carries a live passcode session and,
+// if so, extends it: real use keeps a session open.
+func (s *Server) hasSession(r *http.Request) bool { return s.session(r, true) }
+
+// peekSession checks without extending. The dashboard polls the status every
+// few seconds; if that counted as use, a page left open would never lock.
+func (s *Server) peekSession(r *http.Request) bool { return s.session(r, false) }
+
+func (s *Server) session(r *http.Request, slide bool) bool {
 	c, err := r.Cookie("fg_session")
 	if err != nil {
 		return false
@@ -184,7 +196,9 @@ func (s *Server) hasSession(r *http.Request) bool {
 		delete(s.sessions, c.Value)
 		return false
 	}
-	s.sessions[c.Value] = time.Now().Add(sessionTTL) // sliding
+	if slide {
+		s.sessions[c.Value] = time.Now().Add(sessionTTL)
+	}
 	return true
 }
 
@@ -283,7 +297,7 @@ func (s *Server) statusPayload(r *http.Request) map[string]any {
 		"status":           st,
 		"setup":            s.Auth.IsSet(),
 		"lockedUntil":      nullTime(s.Auth.LockedUntil()),
-		"unlocked":         s.hasSession(r),
+		"unlocked":         s.peekSession(r),
 		"uninstallPending": pending,
 		"updateReady":      s.updateReady(),
 	}
@@ -403,6 +417,66 @@ func (s *Server) endWindow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	send(w, map[string]bool{"ok": true})
+}
+
+// --- free time (rewards) --------------------------------------------------
+
+func (s *Server) grantReward(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Minutes int    `json:"minutes"`
+		Reason  string `json:"reason"`
+		Days    int    `json:"days"`
+	}
+	if !s.reauth(w, r, &b) {
+		return
+	}
+	if b.Days == 0 {
+		b.Days = 1
+	}
+	rw, err := s.Eng.GrantReward(b.Minutes, b.Reason, b.Days)
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	send(w, map[string]any{"reward": rw})
+}
+
+func (s *Server) revokeReward(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		ID string `json:"id"`
+	}
+	if !decode(w, r, &b) {
+		return
+	}
+	if err := s.Eng.RevokeReward(b.ID); err != nil {
+		fail(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	send(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) redeemReward(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Minutes int `json:"minutes"` // 0 = as much as possible
+	}
+	if !decode(w, r, &b) {
+		return
+	}
+	br, err := s.Eng.StartBreak(b.Minutes)
+	if err != nil {
+		fail(w, http.StatusConflict, err.Error(), "invalid")
+		return
+	}
+	send(w, map[string]any{"until": br.Until})
+}
+
+func (s *Server) endBreak(w http.ResponseWriter, r *http.Request) {
+	back, err := s.Eng.EndBreak()
+	if err != nil {
+		fail(w, http.StatusConflict, err.Error(), "invalid")
+		return
+	}
+	send(w, map[string]int{"savedSeconds": back})
 }
 
 func (s *Server) getLog(w http.ResponseWriter, r *http.Request) {

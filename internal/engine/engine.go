@@ -45,6 +45,8 @@ type Engine struct {
 	mu       sync.Mutex
 	ended    map[string]bool
 	active   map[string]schedule.Occurrence
+	blocking bool            // something was actually being enforced at the last tick
+	warned   map[string]bool // heads-up notices already sent
 	want     siteWant
 	events   []Event
 	nextID   int
@@ -67,7 +69,7 @@ type siteWant struct {
 
 func New(version string, st *store.Store, clk *clock.Clock, sites SiteBlocker, ap AppBlocker) *Engine {
 	e := &Engine{Version: version, Store: st, Clock: clk, Sites: sites, Apps: ap,
-		ended: map[string]bool{}, active: map[string]schedule.Occurrence{}, lastErr: map[string]time.Time{},
+		ended: map[string]bool{}, active: map[string]schedule.Occurrence{}, lastErr: map[string]time.Time{}, warned: map[string]bool{},
 		wake: make(chan struct{}, 1), siteWake: make(chan struct{}, 1), syncNow: make(chan struct{}, 1), nextID: 1}
 	for k := range st.State().Ended {
 		e.ended[k] = true
@@ -86,7 +88,7 @@ func (e *Engine) Wake() {
 // Run blocks until ctx is cancelled.
 func (e *Engine) Run(ctx context.Context) {
 	e.lastTick = time.Now()
-	e.tick()
+	e.safely("tick", e.tick)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); e.siteLoop(ctx) }()
@@ -102,8 +104,19 @@ func (e *Engine) Run(ctx context.Context) {
 		case <-t.C:
 		case <-e.wake:
 		}
-		e.tick()
+		e.safely("tick", e.tick)
 	}
+}
+
+// safely runs one pass of a loop and turns a panic into a log line, so a bug in
+// one pass cannot stop enforcement; the next pass simply runs again.
+func (e *Engine) safely(what string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.Store.Log(time.Now(), "error", fmt.Sprintf("internal error in %s (recovered): %v", what, r))
+		}
+	}()
+	fn()
 }
 
 func (e *Engine) tick() {
@@ -111,14 +124,16 @@ func (e *Engine) tick() {
 	cfg := e.Store.Config()
 	loc := cfg.Location()
 
+	led := e.Store.Ledger()
+
 	e.mu.Lock()
-	active := schedule.Active(cfg.Windows, now, loc, e.ended)
-	until := schedule.BlockedUntil(cfg.Windows, now, loc, e.ended)
-	sites, appIDs := schedule.Resolve(active, cfg.Sites, cfg.Apps)
-	e.want = siteWant{sites, until}
+	f := forceAt(cfg, now, loc, e.ended, led)
+	sites, appIDs := schedule.Resolve(f.eff, cfg.Sites, cfg.Apps)
+	e.want = siteWant{sites, f.until}
+	next, hasNext := schedule.Next(cfg.Windows, now, loc, e.ended)
 
 	cur := map[string]schedule.Occurrence{}
-	for _, o := range active {
+	for _, o := range f.all {
 		cur[o.Key()] = o
 	}
 	var started, finished []schedule.Occurrence
@@ -134,10 +149,12 @@ func (e *Engine) tick() {
 	}
 	wasActive := len(e.active) > 0
 	e.active = cur
+	wasBlocking := e.blocking
+	e.blocking = len(f.eff) > 0
 
 	dt := time.Since(e.lastTick)
 	e.lastTick = time.Now()
-	if len(cur) > 0 && dt > 0 && dt < 5*time.Second {
+	if e.blocking && dt > 0 && dt < 5*time.Second { // a free-time break is not focus time
 		e.focus += dt
 	}
 	var summary string
@@ -163,6 +180,10 @@ func (e *Engine) tick() {
 	if summary != "" {
 		e.Store.Log(now, "window", "All windows over: "+summary)
 	}
+	if led.Break != nil && f.brk == nil { // the break's time is up; blocking resumed in this same pass
+		e.finishBreak(now, len(f.all) > 0)
+	}
+	e.warnings(now, loc, f, next, hasNext)
 
 	e.Apps.SetRules(cfg.Rules(appIDs))
 	for _, k := range e.Apps.Scan() {
@@ -177,7 +198,7 @@ func (e *Engine) tick() {
 	if e.Clock != nil && time.Since(e.lastSave) > time.Minute {
 		e.flushFocus()
 	}
-	if wasActive != (len(cur) > 0) || len(started) > 0 || len(finished) > 0 {
+	if wasBlocking != (len(f.eff) > 0) || len(started) > 0 || len(finished) > 0 {
 		e.flushFocus()
 		e.pruneEnded(now)
 		e.wakeSites()

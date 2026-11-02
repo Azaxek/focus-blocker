@@ -23,7 +23,21 @@ jobs:
         run: test -z "$(gofmt -l cmd internal tools)" || (gofmt -l cmd internal tools; exit 1)
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test ./...
+      - name: Test (with the race detector)
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -count=1 ./...
       - name: Build
         run: go build -o dist/focusguard.exe ./cmd/focusguard
+
+  # Known-vulnerability scan of the dependencies and the standard library. It
+  # reports but never blocks a push, because a new advisory is not the author's fault.
+  vulncheck:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

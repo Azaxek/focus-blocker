@@ -58,16 +58,20 @@ func Run(ctx context.Context, o Options, ready func(*App)) error {
 	if err := os.MkdirAll(o.DataDir, 0o700); err != nil {
 		return err
 	}
+	// A service that refuses to start blocks nothing, so problems below are logged and the
+	// service keeps enforcing: it is better to run with a weaker lock than not to run.
+	var lockErr error
 	if !o.Dry {
-		if err := fsx.Lock(o.DataDir); err != nil {
-			return fmt.Errorf("securing data directory: %w", err)
-		}
+		lockErr = fsx.Lock(o.DataDir)
 	}
 	st, err := store.Open(o.DataDir)
 	if err != nil {
 		return err
 	}
 	clk := clock.New()
+	if lockErr != nil {
+		st.Log(clk.Now(), "error", "could not restrict the data folder to administrators: "+lockErr.Error())
+	}
 	au := auth.New(filepath.Join(o.DataDir, "auth.json"), clk.Now)
 
 	var siteB engine.SiteBlocker
@@ -142,24 +146,22 @@ func Run(ctx context.Context, o Options, ready func(*App)) error {
 			},
 		}
 		srv.Upd = mgr
-		go mgr.Run(ctx)
+		go func() {
+			defer recoverLog(st, clk, "updater")
+			mgr.Run(ctx)
+		}()
 	}
 
-	errc := make(chan error, 1)
-	go func() { errc <- srv.ListenAndServe(ctx) }()
+	// The dashboard is not what enforces anything, so a failure to open its port (another
+	// program got there first) must not stop the service: keep trying while the engine works.
+	go serveDashboard(ctx, srv, st, clk)
 	go eng.Run(ctx)
 	st.Log(clk.Now(), "service", "Service started, version "+o.Version)
 	if ready != nil {
 		ready(a)
 	}
 
-	select {
-	case <-ctx.Done():
-	case err := <-errc:
-		if err != nil {
-			return fmt.Errorf("dashboard server: %w", err)
-		}
-	}
+	<-ctx.Done()
 	a.mu.Lock()
 	clean := a.clean
 	a.mu.Unlock()
@@ -167,6 +169,34 @@ func Run(ctx context.Context, o Options, ready func(*App)) error {
 		eng.Shutdown()
 	}
 	return nil
+}
+
+// retryEvery is how long the dashboard waits before trying its port again.
+var retryEvery = 10 * time.Second
+
+func serveDashboard(ctx context.Context, srv *server.Server, st *store.Store, clk *clock.Clock) {
+	var lastLog time.Time
+	for ctx.Err() == nil {
+		err := srv.ListenAndServe(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		if time.Since(lastLog) > 10*time.Minute { // the log would fill up otherwise
+			st.Log(clk.Now(), "error", "the dashboard could not start ("+err.Error()+"); blocking continues and it will keep trying")
+			lastLog = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(retryEvery):
+		}
+	}
+}
+
+func recoverLog(st *store.Store, clk *clock.Clock, what string) {
+	if r := recover(); r != nil {
+		st.Log(clk.Now(), "error", fmt.Sprintf("internal error in %s (recovered): %v", what, r))
+	}
 }
 
 // dryRun is the blocker used in console/dev mode: it only reports.

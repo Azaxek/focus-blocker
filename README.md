@@ -12,6 +12,7 @@ Windows service "FocusGuard" (SYSTEM, starts at boot, restarts itself)
  ├─ site blocker     hosts file + local DNS sinkhole (via NRPT) + firewall + browser policies
  ├─ app blocker      process scan every second; matches name, folder, original file name, publisher
  ├─ watchdog         every 3 s re-checks and repairs hosts / DNS / firewall / policy changes
+ ├─ free time        parent-granted credit a child can spend to pause a window (see below)
  ├─ auth             argon2id passcode hash, 5 wrong tries = 15 minute lockout (survives restarts)
  ├─ updater          signed GitHub Releases, installs only between focus windows, rolls back on failure
  └─ dashboard        http://127.0.0.1:47820 (loopback only)
@@ -53,7 +54,20 @@ The lock is only as strong as the account it runs under. Windows lets an adminis
 - **Dashboard:** big *Blocking* / *Free time* status, countdown, today's timeline, focus streak and hours.
 - **Schedule:** click and drag on a day to add a window; click a block to edit it. Windows can repeat weekly, be one-day-only, cross midnight, overlap, and use the global lists or their own.
 - **Block lists:** category presets (Video, Social, Streaming, Chat, Gaming), search, add/remove sites; apps from presets, from a list of running programs, or by file name.
-- **Parent area:** activity log (window start/end, blocked attempts, tamper events, update history), update settings, change passcode, stop the service.
+- **Parent area:** activity log (window start/end, blocked attempts, tamper events, free time, update history), free time, update settings, time zone, change passcode, stop the service.
+- **Heads-up notifications:** a notice 5 minutes before a window starts and 2 minutes before earned free time ends.
+
+### Earned free time (rewards)
+
+A parent can reward the child, for example for going to the gym, with free time that pauses a focus window.
+
+1. **Parent:** *Parent area > Free time*. Pick a reason (quick buttons for Gym, Homework, Chores, or type your own), minutes (5 to 120) and how long it stays valid (tonight, 2 days, this week), then enter the passcode. **Every grant asks for the passcode again**, even in an unlocked dashboard.
+2. **Child:** the *Today* page shows the saved-up time. *Use 15 min* or *Use all* starts a break straight away, **with no passcode**, because a parent already approved it. Focus time comes back by itself when the break ends, or earlier with *Back to focus now*; unused minutes are returned.
+3. **Limits** (all enforced by the service, not the page): a daily maximum a parent can grant (default 60 minutes, adjustable); credit expires at midnight of its last valid day; the earliest-expiring credit is spent first; a break can never be longer than the focus time it pauses; only one break runs at a time; a break survives a restart of the service.
+4. **Exam nights:** switch off *Earned free time can pause this window* in a window's settings and no credit can pause it. If a paused window overlaps one that cannot be paused, the second keeps blocking.
+5. Time on a break does not count as focus time and does not break the focus streak. The activity log records every grant, break and refund.
+
+Focus Guard cannot tell whether the gym visit happened. A grant is the parent's word; the app only makes sure it is spent within the limits the parent set.
 
 The interface follows the flat "true-black" app style from the taste-skill design guide (no gradients, glows or borders on cards, one data colour, light and dark themes). It never waits on the network: every edit changes the screen first and saves in the background, and a save the service rejects is rolled back with a message. The first screen needs no request at all, because status and settings are embedded in the page.
 
@@ -98,7 +112,9 @@ scripts\verify-enforcement.ps1 -Expect Blocking        # during a window, from a
 scripts\dev-uninstall.ps1                  # (admin) remove everything the dev install added
 ```
 
-Layout: `cmd/focusguard` (entry point), `internal/{clock,schedule,auth,store,apps,sites,engine,updater,server,winsvc,tray,app}`, `installer/` (Inno Setup), `tools/` (icon, keygen, signer), `.github/workflows/`.
+Layout: `cmd/focusguard` (entry point), `internal/{clock,schedule,rewards,auth,store,apps,sites,engine,updater,server,winsvc,tray,app,fsx}`, `installer/` (Inno Setup), `tools/` (icon, keygen, signer), `.github/workflows/`.
+
+`go test -race ./...` needs a C compiler on Windows (for example MinGW `gcc` on the PATH); CI runs it. The parsers have fuzz targets: `go test -run XXX -fuzz FuzzNormalize -fuzztime 30s ./internal/sites` (also `FuzzHostsMerge`, and `FuzzWindowValidate` in `./internal/schedule`).
 
 ## What is tested
 
@@ -112,9 +128,12 @@ Automated (`go test ./...`, also run by CI on Windows):
 | App blocking | name, folder, original-file-name, publisher and Store-package matching; protected system processes; a **real** process is closed in well under 2 s, a bystander survives |
 | Site blocking | subdomain matching without look-alikes, hosts merge keeps other lines, tampering detected and restored, **real** sinkhole on ports 53/80 answers DNS and serves the block page |
 | Updater | bad checksum, bad signature, foreign key, no key built in, wrong host / repo / http, downgrade, prerelease all rejected; rollback restores the old version; passcode and settings byte-identical after success and rollback |
-| Dashboard API | Host allow-list, token, Origin / Sec-Fetch-Site, passcode session, cookie flags, lockout over HTTP, passcode re-entry for risky actions, no secrets in public endpoints |
+| Dashboard API | Host allow-list, token, Origin / Sec-Fetch-Site, passcode session, cookie flags, lockout over HTTP, passcode re-entry for risky actions, no secrets in public endpoints, the status poll does not keep a session alive |
+| Free time | grant limits and daily cap, expiry, earliest-expiring spent first, refund on early end, a break never outlasts its window, windows that opt out, overlapping windows, survives a restart, who may grant / spend / revoke; a randomised test checks that credit is never created or negative |
+| Resilience | a damaged settings file is restored from its backup (or replaced with defaults) and the service still starts; a panic in one pass of the engine or watchdog is recovered; the dashboard port being taken does not stop the service; garbage and oversized packets do not stop the DNS sinkhole |
+| Parsers | fuzzed: domain normalisation, hosts-file merge/clean, window validation; schedule invariants checked across seven zones and DST changes |
 
-**Not yet verified on a real installed machine** (needs an elevated shell, which the development session did not have): blocking in two real browsers end to end, the notification on app close, the installer itself, and a real update from a published release. `scripts/verify-enforcement.ps1` checks the first two automatically plus by eye; the Release workflow's dry run builds the installer. Please run them once after installing.
+**Checked on a real installed copy:** blocking in Chrome and Edge, the app-closed notification, and the browser-extension proxy case. **Not yet verified on a real machine:** the installer itself, a real update from a published release, Safe Mode, and the tamper-restore timing (`scripts/tamper-test.ps1` runs it during a window; it needs one approval from an administrator). `scripts/verify-enforcement.ps1` checks enforcement automatically; the Release workflow's dry run builds the installer.
 
 ## Known limitations and bypass routes
 
@@ -136,8 +155,10 @@ Be honest with yourselves about these. None of the mitigations is perfect.
 | **Modified or re-signed copies of a blocked app** | App matching trusts the file name, folder, version-info and signature fields, and an attacker can edit all of them on a copy outside any blocked folder. | Allow-listing (AppLocker/WDAC) is the only strong answer. Use the "list running apps" helper to add the exact executable name. |
 | **Wi-Fi/ethernet changes that bypass NRPT** | Rare resolvers or per-app DNS clients may ignore NRPT. | The hosts-file layer covers the exact domain and `www`; the watchdog re-checks every 3 seconds. |
 | **Antivirus flags the hosts file edit** | Some security products treat any hosts change as suspicious. | Add an exclusion for `C:\Program Files\FocusGuard`. |
-| **Windows time zone changed while running** | Go reads the time zone when the service starts. | Restart the service (or reboot) after changing the PC time zone. |
+| **Windows time zone changed** | A standard Windows user is allowed to change the time zone, which would move every window by hours after the next restart. | The schedule is **pinned** to a time zone chosen in the dashboard (set automatically the first time a parent unlocks it; change it in *Parent area > Security*). The dashboard shows a notice when the PC's zone no longer matches. |
 | **Port 53 or 80 already in use on 127.0.0.1** | Some VPNs and Hyper-V/WSL tools bind them. | The hosts file, firewall and policies still apply, but subdomain wildcards and the block page do not. The dashboard shows an "Enforcement problem" banner. |
+| **Another program holding port 47820** | The dashboard cannot start, and a fake page there could ask for the passcode. | Blocking carries on regardless and the service keeps retrying; the log records it. Only type the passcode into the dashboard opened from the Focus Guard shortcut or tray icon. |
+| **A free-time grant the child did not earn** | The app cannot verify the gym visit or the homework. | Grants need the passcode every time, are capped per day, expire, and are all logged. |
 
 ### If the parent passcode is lost
 

@@ -268,6 +268,136 @@ func TestPublicEndpointsExposeNoSecrets(t *testing.T) {
 	}
 }
 
+// alwaysOn is a pair of back-to-back windows that cover every moment of every day.
+func alwaysOn() []schedule.Window {
+	all := []int{0, 1, 2, 3, 4, 5, 6}
+	return []schedule.Window{
+		{ID: "am", Name: "Morning", Days: all, Start: "00:00", End: "12:00"},
+		{ID: "pm", Name: "Afternoon", Days: all, Start: "12:00", End: "00:00"},
+	}
+}
+
+type statusBody struct {
+	Status struct {
+		Blocking bool
+		Rewards  struct {
+			BalanceSec   int
+			CanPause     bool
+			GrantedToday int
+			Break        *struct{}
+		}
+	}
+}
+
+func (r *rig) status() statusBody {
+	var s statusBody
+	json.Unmarshal(r.do("GET", "/api/status", nil).Body.Bytes(), &s)
+	return s
+}
+
+func TestFreeTimeFlowAndWhoMayDoWhat(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	cfg := r.s.Store.Config()
+	cfg.Windows = alwaysOn()
+	if w := r.do("PUT", "/api/config", cfg); w.Code != 200 {
+		t.Fatal(w.Body)
+	}
+	grant := func(pass string) int {
+		return r.do("POST", "/api/rewards/grant", map[string]any{"minutes": 30, "reason": "Gym", "days": 2, "passcode": pass}).Code
+	}
+	if c := grant("not-the-passcode"); c != 403 {
+		t.Fatalf("a live session alone must not be enough to grant: %d", c)
+	}
+	if c := grant("parent-secret"); c != 200 {
+		t.Fatalf("grant: %d", c)
+	}
+	if s := r.status(); !s.Status.Blocking || s.Status.Rewards.BalanceSec != 1800 || !s.Status.Rewards.CanPause || s.Status.Rewards.GrantedToday != 30 {
+		t.Fatalf("%+v", s)
+	}
+
+	// the child (no passcode session) spends it, and can hand it back
+	r.do("POST", "/api/auth/logout", nil)
+	if c := grant("parent-secret"); c != 401 {
+		t.Fatalf("granting needs the unlocked dashboard: %d", c)
+	}
+	if w := r.do("POST", "/api/rewards/redeem", map[string]int{"minutes": 0}); w.Code != 200 {
+		t.Fatalf("redeem: %d %s", w.Code, w.Body)
+	}
+	if s := r.status(); s.Status.Blocking || s.Status.Rewards.Break == nil {
+		t.Fatalf("break should lift the block: %+v", s)
+	}
+	if w := r.do("POST", "/api/rewards/redeem", map[string]int{"minutes": 5}); w.Code != 409 {
+		t.Fatalf("second break: %d", w.Code)
+	}
+	if w := r.do("POST", "/api/rewards/end", nil); w.Code != 200 {
+		t.Fatalf("end: %d %s", w.Code, w.Body)
+	}
+	if s := r.status(); !s.Status.Blocking || s.Status.Rewards.BalanceSec < 1700 {
+		t.Fatalf("blocking back, minutes returned: %+v", s)
+	}
+	if w := r.do("POST", "/api/rewards/end", nil); w.Code != 409 {
+		t.Fatalf("nothing to end: %d", w.Code)
+	}
+
+	// token and origin rules apply to the child's calls too
+	bad := func(q *http.Request) { q.Header.Set("Origin", "https://evil.example") }
+	if w := r.do("POST", "/api/rewards/redeem", map[string]int{"minutes": 5}, bad); w.Code != 403 {
+		t.Fatalf("cross-origin redeem: %d", w.Code)
+	}
+	// only a parent session may revoke
+	if w := r.do("POST", "/api/rewards/revoke", map[string]string{"id": "x"}); w.Code != 401 {
+		t.Fatalf("revoke without a session: %d", w.Code)
+	}
+}
+
+func TestGrantInputIsChecked(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	for _, m := range []int{0, 4, 500} {
+		if w := r.do("POST", "/api/rewards/grant", map[string]any{"minutes": m, "passcode": "parent-secret"}); w.Code != 400 {
+			t.Errorf("minutes=%d: %d", m, w.Code)
+		}
+	}
+	r.do("POST", "/api/rewards/grant", map[string]any{"minutes": 60, "passcode": "parent-secret"})
+	if w := r.do("POST", "/api/rewards/grant", map[string]any{"minutes": 5, "passcode": "parent-secret"}); w.Code != 400 || !strings.Contains(w.Body.String(), "limit") {
+		t.Errorf("daily limit: %d %s", w.Code, w.Body)
+	}
+}
+
+// The dashboard polls /api/status every few seconds. That must not keep a
+// parent's session alive, or an unattended page would never lock.
+func TestStatusPollingDoesNotExtendTheSession(t *testing.T) {
+	r := newRig(t)
+	r.setup()
+	near := time.Now().Add(30 * time.Second)
+	r.s.mu.Lock()
+	for k := range r.s.sessions {
+		r.s.sessions[k] = near
+	}
+	r.s.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		r.do("GET", "/api/status", nil)
+	}
+	r.s.mu.Lock()
+	for _, exp := range r.s.sessions {
+		if !exp.Equal(near) {
+			t.Fatalf("polling extended the session by %v", exp.Sub(near))
+		}
+	}
+	r.s.mu.Unlock()
+	if w := r.do("GET", "/api/log", nil); w.Code != 200 { // real use does extend it
+		t.Fatal(w.Code)
+	}
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+	for _, exp := range r.s.sessions {
+		if exp.Sub(near) < time.Minute {
+			t.Fatal("real use should keep the session alive")
+		}
+	}
+}
+
 func TestUninstallNeedsApproval(t *testing.T) {
 	r := newRig(t)
 	r.setup()

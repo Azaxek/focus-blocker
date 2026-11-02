@@ -17,25 +17,51 @@ type OccView struct {
 }
 
 type Status struct {
-	Version   string     `json:"version"`
-	Now       time.Time  `json:"now"`
-	Zone      string     `json:"zone"`
-	Blocking  bool       `json:"blocking"`
-	Active    []OccView  `json:"active"`
-	Until     *time.Time `json:"until,omitempty"` // when continuous blocking ends
-	Next      *OccView   `json:"next,omitempty"`
-	Today     []OccView  `json:"today"`
-	DayStart  time.Time  `json:"dayStart"`
-	DayEnd    time.Time  `json:"dayEnd"`
-	Sites     int        `json:"sites"` // domains blocked right now
-	Apps      int        `json:"apps"`
-	Streak    int        `json:"streak"`
-	FocusDay  float64    `json:"focusHoursToday"`
-	FocusWeek float64    `json:"focusHoursWeek"`
-	SiteHits  int        `json:"siteBlocksToday"`
-	AppHits   int        `json:"appBlocksToday"`
-	TimeSync  bool       `json:"timeSynced"`
-	Problem   string     `json:"problem,omitempty"`
+	Version   string      `json:"version"`
+	Now       time.Time   `json:"now"`
+	Zone      string      `json:"zone"`
+	Blocking  bool        `json:"blocking"`
+	Active    []OccView   `json:"active"`
+	Until     *time.Time  `json:"until,omitempty"` // when continuous blocking ends
+	Next      *OccView    `json:"next,omitempty"`
+	Today     []OccView   `json:"today"`
+	DayStart  time.Time   `json:"dayStart"`
+	DayEnd    time.Time   `json:"dayEnd"`
+	Sites     int         `json:"sites"` // domains blocked right now
+	Apps      int         `json:"apps"`
+	Streak    int         `json:"streak"`
+	FocusDay  float64     `json:"focusHoursToday"`
+	FocusWeek float64     `json:"focusHoursWeek"`
+	SiteHits  int         `json:"siteBlocksToday"`
+	AppHits   int         `json:"appBlocksToday"`
+	TimeSync  bool        `json:"timeSynced"`
+	Problem   string      `json:"problem,omitempty"`
+	Notice    string      `json:"notice,omitempty"` // a damaged file was restored or reset
+	Paused    []OccView   `json:"paused"`           // windows a free-time break is pausing
+	Rewards   RewardsView `json:"rewards"`
+}
+
+type RewardItem struct {
+	ID      string    `json:"id"`
+	Reason  string    `json:"reason"`
+	Left    int       `json:"left"` // seconds
+	Expires time.Time `json:"expires"`
+}
+
+type BreakView struct {
+	Start time.Time `json:"start"`
+	Until time.Time `json:"until"`
+}
+
+type RewardsView struct {
+	BalanceSec   int          `json:"balanceSec"`
+	Items        []RewardItem `json:"items"`
+	Break        *BreakView   `json:"break,omitempty"`
+	CanPause     bool         `json:"canPause"`    // focus time is on and the saved-up time can pause it
+	PauseMaxSec  int          `json:"pauseMaxSec"` // the longest break possible right now
+	GrantedToday int          `json:"grantedToday"`
+	CapMin       int          `json:"capMin"`
+	Streak       int          `json:"streak"` // consecutive days with a reward
 }
 
 func view(o schedule.Occurrence, ended map[string]bool) OccView {
@@ -58,18 +84,31 @@ func (e *Engine) Status() Status {
 	n := now.In(loc)
 	dayStart := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, loc)
 	dayEnd := dayStart.AddDate(0, 0, 1)
-	s := Status{Version: e.Version, Now: now, Zone: loc.String(), DayStart: dayStart, DayEnd: dayEnd, Problem: problem,
-		Active: []OccView{}, Today: []OccView{}}
+	s := Status{Version: e.Version, Now: now, Zone: loc.String(), DayStart: dayStart, DayEnd: dayEnd, Problem: problem, Notice: e.Store.Notice,
+		Active: []OccView{}, Paused: []OccView{}, Today: []OccView{}}
 	s.TimeSync, _ = e.Clock.Synced()
 
-	active := schedule.Active(cfg.Windows, now, loc, ended)
-	for _, o := range active {
+	st := e.Store.State()
+	days := st.Days
+	f := forceAt(cfg, now, loc, ended, st.Rewards)
+	paused := map[string]bool{}
+	for _, o := range f.all {
+		paused[o.Key()] = true
+	}
+	for _, o := range f.eff {
 		s.Active = append(s.Active, view(o, ended))
+		delete(paused, o.Key())
 	}
-	s.Blocking = len(active) > 0
-	if u := schedule.BlockedUntil(cfg.Windows, now, loc, ended); !u.IsZero() {
-		s.Until = &u
+	for _, o := range f.all {
+		if paused[o.Key()] {
+			s.Paused = append(s.Paused, view(o, ended))
+		}
 	}
+	s.Blocking = len(f.eff) > 0
+	if !f.until.IsZero() {
+		s.Until = &f.until
+	}
+	s.Rewards = rewardsView(cfg, now, loc, ended, st, f)
 	if nx, ok := schedule.Next(cfg.Windows, now, loc, ended); ok {
 		v := view(nx, ended)
 		s.Next = &v
@@ -77,10 +116,9 @@ func (e *Engine) Status() Status {
 	for _, o := range schedule.Occurrences(cfg.Windows, dayStart, dayEnd, loc) {
 		s.Today = append(s.Today, view(o, ended))
 	}
-	sites, appIDs := schedule.Resolve(active, cfg.Sites, cfg.Apps)
+	sites, appIDs := schedule.Resolve(f.eff, cfg.Sites, cfg.Apps)
 	s.Sites, s.Apps = len(sites), len(cfg.Rules(appIDs))
 
-	days := e.Store.State().Days
 	today := days[dayKey(now, loc)]
 	if today != nil {
 		s.FocusDay = hours(today.FocusSec) + e.pendingHours()

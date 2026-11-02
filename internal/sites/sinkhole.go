@@ -67,6 +67,13 @@ func (s *Sinkhole) note(domain string) {
 
 func (s *Sinkhole) dnsHandler() dns.Handler {
 	return dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		defer func() { // whatever a client sends, the resolver for the whole PC must keep answering
+			if recover() != nil {
+				m := new(dns.Msg)
+				m.SetRcode(r, dns.RcodeServerFailure)
+				w.WriteMsg(m)
+			}
+		}()
 		m := new(dns.Msg)
 		m.SetReply(r)
 		m.Authoritative = true
@@ -92,6 +99,14 @@ func (s *Sinkhole) dnsHandler() dns.Handler {
 		}
 		w.WriteMsg(m)
 	})
+}
+
+// dnsServer builds the listener for one network ("udp" or "tcp"). UDPSize is the
+// largest possible datagram: on Windows a UDP packet bigger than the read buffer
+// is a read error, and the DNS library treats that as fatal, so any local program
+// could otherwise silence the sinkhole by sending one large packet to port 53.
+func (s *Sinkhole) dnsServer(network string) *dns.Server {
+	return &dns.Server{Addr: "127.0.0.1:53", Net: network, Handler: s.dnsHandler(), UDPSize: 65535}
 }
 
 func (s *Sinkhole) page() http.Handler {
@@ -124,14 +139,21 @@ func (s *Sinkhole) Start() error {
 	var errs []error
 	started := false
 	for _, network := range []string{"udp", "tcp"} {
-		srv := &dns.Server{Addr: "127.0.0.1:53", Net: network, Handler: s.dnsHandler()}
+		srv := s.dnsServer(network)
 		ready := make(chan struct{})
 		srv.NotifyStartedFunc = func() { close(ready) }
 		fail := make(chan error, 1)
-		go func() { fail <- srv.ListenAndServe() }()
+		go func() {
+			err := srv.ListenAndServe()
+			fail <- err
+			s.died(srv)
+		}()
 		select {
 		case <-ready:
-			s.servers, started = append(s.servers, srv), true
+			s.mu.Lock()
+			s.servers = append(s.servers, srv)
+			s.mu.Unlock()
+			started = true
 		case err := <-fail:
 			errs = append(errs, fmt.Errorf("dns %s: %w", network, err))
 		case <-time.After(3 * time.Second):
@@ -146,7 +168,9 @@ func (s *Sinkhole) Start() error {
 		}
 		h := &http.Server{Handler: s.page(), ReadHeaderTimeout: 5 * time.Second}
 		go h.Serve(ln)
+		s.mu.Lock()
 		s.web = append(s.web, h)
+		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	s.up = started
@@ -162,16 +186,28 @@ func (s *Sinkhole) Running() bool {
 }
 
 func (s *Sinkhole) Stop() {
-	for _, srv := range s.servers {
+	s.mu.Lock()
+	servers, web := s.servers, s.web
+	s.servers, s.web, s.up = nil, nil, false
+	s.mu.Unlock()
+	for _, srv := range servers {
 		srv.Shutdown()
 	}
-	for _, h := range s.web {
+	for _, h := range web {
 		h.Close()
 	}
-	s.servers, s.web = nil, nil
+}
+
+// died notes that a DNS server stopped on its own rather than through Stop, so
+// Running turns false and the watchdog starts the sinkhole again.
+func (s *Sinkhole) died(srv *dns.Server) {
 	s.mu.Lock()
-	s.up = false
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	for _, x := range s.servers { // Stop empties the list first, so an orderly stop is not a death
+		if x == srv {
+			s.up = false
+		}
+	}
 }
 
 const blockPage = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

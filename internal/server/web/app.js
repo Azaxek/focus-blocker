@@ -38,6 +38,10 @@ const fmtDur = ms => { const s = Math.max(0, Math.floor(ms / 1000)), hh = Math.f
 const hrs = x => x < 1 ? [String(Math.round(x * 60)), 'min'] : [String(Math.round(x * 10) / 10), 'h'];
 const DAYS = [[1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'], [0, 'Sun']];
 const uid = () => 'w' + Math.random().toString(36).slice(2, 10);
+// The schedule follows a pinned zone, so changing the Windows time zone cannot move a window.
+const BROWSER_ZONE = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { return ''; } })();
+const zoneOffset = z => { try { return new Intl.DateTimeFormat('en-US', { timeZone: z, timeZoneName: 'longOffset' }).format(new Date()); } catch { return z; } };
+const wholeMin = sec => Math.floor(sec / 60);
 
 /* ---------- network ---------- */
 class ApiError extends Error { constructor(m, code, status) { super(m); this.code = code; this.status = status; } }
@@ -88,9 +92,12 @@ async function unlock() {
   if (S.unlocked) return true;
   const until = S.lockedUntil ? ` Locked until ${fmtTime(S.lockedUntil)}.` : '';
   const ok = await askPasscode({ title: 'Parent passcode', body: 'Enter the passcode to make changes.' + until, label: 'Unlock', onSubmit: p => api('/api/auth/login', 'POST', { passcode: p }) });
-  if (ok) { S.unlocked = true; paintChrome(); render(); }
+  if (ok) { S.unlocked = true; paintChrome(); render(); ensureZone(); }
   return ok;
 }
+// Pin the schedule to the zone the parent is in, once, so changing the Windows time zone cannot move a window.
+let zoneTried = false;
+function ensureZone() { if (zoneTried || !S.unlocked || S.cfg.timezone || !BROWSER_ZONE) return; zoneTried = true; edit(c => { c.timezone = BROWSER_ZONE; }); }
 
 /* ---------- optimistic edits ---------- */
 // edit() changes S.cfg and re-renders immediately; the save happens in the background.
@@ -164,6 +171,8 @@ function paintChrome() {
   const st = S.status, b = $('#banners'); if (!b) return;
   const items = [];
   if (st.problem) items.push(h('div', { class: 'banner bad', role: 'alert' }, 'Enforcement problem: ', st.problem));
+  if (st.notice) items.push(h('div', { class: 'banner bad', role: 'alert' }, st.notice));
+  if (S.cfg.timezone && zoneOffset(S.cfg.timezone) !== zoneOffset(BROWSER_ZONE)) items.push(h('div', { class: 'banner' }, `This PC's time zone (${BROWSER_ZONE}) is not the one Focus Guard follows (${S.cfg.timezone}). Windows stay on ${S.cfg.timezone}.`));
   if (!st.timeSynced) items.push(h('div', { class: 'banner' }, 'Internet time has not been checked yet, so the PC clock is trusted for now.'));
   if (S.updateReady) items.push(h('div', { class: 'banner' }, `Version ${S.updateReady} is downloaded and installs when no focus window is active.`));
   b.replaceChildren(...items);
@@ -190,8 +199,9 @@ function render({ reset = false } = {}) {
 /* ---------- today ---------- */
 const kpi = (k, v, unit) => h('div', { class: 'kpi' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v, unit ? h('small', {}, unit) : null));
 function pageToday(view) {
-  const s = S.status, free = !s.blocking, next = s.next;
-  const finding = free ? (next ? `Next: ${next.name}, ${fmtDate(next.start)} at ${fmtTime(next.start)}.` : 'No focus time is scheduled.')
+  const s = S.status, R = s.rewards, onBreak = !!R.break, free = !s.blocking, next = s.next;
+  const finding = onBreak && free ? `Earned free time until ${fmtTime(R.break.until)}, then focus time is back.`
+    : free ? (next ? `Next: ${next.name}, ${fmtDate(next.start)} at ${fmtTime(next.start)}.` : 'No focus time is scheduled.')
     : `${s.active.map(a => a.name).join(' and ')} is on until ${fmtTime(s.until)}. ${s.sites} sites and ${s.apps} apps are blocked.`;
   view.append(h('div', { class: 'titlerow' }, h('h1', {}, 'Today'), h('p', {}, finding)));
   const [fd, fdu] = hrs(s.focusHoursToday), [fw, fwu] = hrs(s.focusHoursWeek);
@@ -199,7 +209,10 @@ function pageToday(view) {
     h('div', { class: 'word' }, free ? 'Free time' : 'Blocking'),
     h('div', { class: 'clock', id: 'clock', 'aria-hidden': 'true' }, '--:--'), h('div', { class: 'muted', id: 'clocksub' }),
     !free ? h('div', { class: 'track', role: 'progressbar', 'aria-label': 'Time elapsed in this window' }, h('i', { id: 'prog' })) : null,
+    onBreak && free ? h('div', {}, h('button', { class: 'btn primary', onclick: backToFocus }, 'Back to focus now')) : null,
     !free ? h('div', {}, h('button', { class: 'btn danger', onclick: () => endEarly(s.active) }, 'End early (parent)')) : null));
+  const ft = freeTimeCard(s);
+  if (ft) view.append(ft);
   view.append(h('section', { class: 'card kpis', 'aria-label': 'Summary' },
     kpi('Focus streak', String(s.streak), s.streak === 1 ? 'day' : 'days'), kpi('Focus today', fd, fdu), kpi('Last 7 days', fw, fwu),
     kpi('Blocked today', String(s.siteBlocksToday + s.appBlocksToday), `${s.siteBlocksToday} sites, ${s.appBlocksToday} apps`)));
@@ -210,6 +223,33 @@ function pageToday(view) {
     h('div', { class: 'ticks', 'aria-hidden': 'true' }, ['12a', '3a', '6a', '9a', '12p', '3p', '6p', '9p', '12a'].map(t => h('span', {}, t))),
     s.today.length ? h('ul', { class: 'rows' }, s.today.map(o => h('li', {}, h('b', {}, o.name), o.ended ? h('span', { class: 'pill warn' }, 'ended early') : null, h('span', { class: 't' }, `${fmtTime(o.start)} – ${fmtTime(o.end)}`)))) : h('p', { class: 'empty' }, 'Nothing is scheduled today.')));
   tick();
+}
+// Earned free time: visible to the child, spendable without the passcode (a parent grants it).
+function freeTimeCard(s) {
+  const R = s.rewards;
+  if (!R.balanceSec) return null; // while a break runs the status card above already says so
+  const when = x => `${fmtDate(x)} ${fmtTime(x)}`;
+  const items = R.items.map(i => h('li', {}, h('b', {}, i.reason), h('span', { class: 't' }, `${wholeMin(i.left)} min · good until ${when(i.expires)}`)));
+  const maxMin = wholeMin(R.pauseMaxSec), buttons = [];
+  if (R.canPause) {
+    if (maxMin > 15) buttons.push(h('button', { class: 'btn', onclick: ev => redeem(15, ev.currentTarget) }, 'Use 15 min'));
+    buttons.push(h('button', { class: 'btn primary', onclick: ev => redeem(0, ev.currentTarget) }, maxMin > 15 ? `Use all (${maxMin} min)` : `Use ${maxMin} min`));
+  }
+  const hint = R.break ? `Free time is running until ${fmtTime(R.break.until)}.`
+    : R.canPause ? 'Using it pauses focus time. Whatever is left stays saved.'
+    : s.blocking ? 'This focus time cannot be paused.' : 'You can use it during focus time.';
+  return h('section', { class: 'card', 'aria-label': 'Earned free time' }, h('h2', {}, `Earned free time · ${wholeMin(R.balanceSec)} min`),
+    items.length ? h('ul', { class: 'rows' }, items) : null, h('p', { class: 'muted', style: 'margin-top:10px' }, hint),
+    buttons.length ? h('div', { class: 'row', style: 'margin-top:12px' }, buttons) : null);
+}
+async function redeem(minutes, btn) {
+  btn.disabled = true;
+  try { await api('/api/rewards/redeem', 'POST', { minutes }); await refreshStatus(); render(); toast('Free time started'); }
+  catch (e) { btn.disabled = false; toast(e.message, 'bad'); await refreshStatus().catch(() => {}); render(); }
+}
+async function backToFocus() {
+  try { const r = await api('/api/rewards/end', 'POST', {}); await refreshStatus(); render(); toast(`Back to focus. ${wholeMin(r.savedSeconds)} min saved for later.`); }
+  catch (e) { toast(e.message, 'bad'); await refreshStatus().catch(() => {}); render(); }
 }
 async function endEarly(active) {
   let target = active[0];
@@ -226,9 +266,10 @@ let refreshing = false;
 function tick() {
   const s = S.status, now = nowMs(), clock = $('#clock');
   if (clock) {
-    const target = s.blocking ? Date.parse(s.until) : s.next ? Date.parse(s.next.start) : null;
+    const brk = !s.blocking && s.rewards.break;
+    const target = s.blocking ? Date.parse(s.until) : brk ? Date.parse(brk.until) : s.next ? Date.parse(s.next.start) : null;
     clock.textContent = target ? fmtDur(target - now) : '—';
-    $('#clocksub').textContent = target ? (s.blocking ? 'remaining' : 'until the next window') : '';
+    $('#clocksub').textContent = target ? (s.blocking ? 'remaining' : brk ? 'of free time left' : 'until the next window') : '';
     const prog = $('#prog');
     if (prog && s.active.length) { const a = Math.min(...s.active.map(x => Date.parse(x.start))); prog.style.width = Math.min(100, Math.max(0, (now - a) / (Date.parse(s.until) - a) * 100)) + '%'; }
     if (target && target - now < -800 && !refreshing) { refreshing = true; refreshStatus().then(() => { paintChrome(); render(); }).finally(() => { refreshing = false; }); }
@@ -283,7 +324,7 @@ function drag(col, day) {
 async function editWindow(init) {
   if (!(await unlock())) return;
   const isNew = !init.id;
-  const w = { id: init.id || uid(), name: init.name || '', days: init.days || [1, 2, 3, 4, 5], date: init.date || '', start: init.start || '15:30', end: init.end || '21:00', ownLists: !!init.ownLists, sites: init.sites || [], apps: init.apps || [], disabled: !!init.disabled };
+  const w = { id: init.id || uid(), name: init.name || '', days: init.days || [1, 2, 3, 4, 5], date: init.date || '', start: init.start || '15:30', end: init.end || '21:00', ownLists: !!init.ownLists, sites: init.sites || [], apps: init.apps || [], disabled: !!init.disabled, noBreak: !!init.noBreak };
   modal(close => {
     const err = h('p', { class: 'err', role: 'alert' });
     const name = h('input', { type: 'text', value: w.name, placeholder: 'e.g. School nights', maxlength: 60, autofocus: true, 'aria-label': 'Name' });
@@ -297,6 +338,7 @@ async function editWindow(init) {
     const appBoxes = S.cfg.appRules.map(r => h('label', { class: 'switch' }, h('input', { type: 'checkbox', value: r.id, checked: w.apps.includes(r.id) }), r.name));
     const own = h('div', { style: 'display:grid;gap:12px' }, h('label', { class: 'field' }, h('span', {}, 'Sites'), sitesTa), h('div', { class: 'row', style: 'gap:14px' }, appBoxes));
     const off = h('input', { type: 'checkbox', checked: !w.disabled });
+    const canPause = h('input', { type: 'checkbox', checked: !w.noBreak });
     const pickedRep = () => $('input[name=rep]:checked', rep).value, pickedLm = () => $('input[name=lm]:checked', lm).value;
     function sync() { daysEl.hidden = pickedRep() === 'once'; dateWrap.hidden = pickedRep() !== 'once'; own.hidden = pickedLm() !== 'own'; }
     const dateWrap = h('label', { class: 'field' }, h('span', {}, 'Date'), date);
@@ -304,6 +346,7 @@ async function editWindow(init) {
     return h('form', { class: 'dlg', onsubmit: e => {
       e.preventDefault();
       const nw = { id: w.id, name: name.value.trim(), start: start.value, end: end.value, disabled: !off.checked };
+      if (!canPause.checked) nw.noBreak = true;
       if (!nw.name) { err.textContent = 'Give the window a name.'; return; }
       if (!nw.start || !nw.end || nw.start === nw.end) { err.textContent = 'Start and end must be different times.'; return; }
       if (pickedRep() === 'once') nw.date = date.value; else { nw.days = boxes.map(l => l.firstChild).filter(i => i.checked).map(i => Number(i.value)); if (!nw.days.length) { err.textContent = 'Pick at least one day.'; return; } }
@@ -313,7 +356,8 @@ async function editWindow(init) {
     } },
       h('h2', {}, isNew ? 'New focus window' : 'Edit focus window'), h('label', { class: 'field' }, h('span', {}, 'Name'), name), rep, daysEl, dateWrap,
       h('div', { class: 'row' }, h('label', { class: 'field grow' }, h('span', {}, 'Starts'), start), h('label', { class: 'field grow' }, h('span', {}, 'Ends'), end)),
-      h('p', { class: 'faint' }, 'If the end is earlier than the start, the window runs past midnight.'), lm, own, h('label', { class: 'switch' }, off, 'Enabled'), err,
+      h('p', { class: 'faint' }, 'If the end is earlier than the start, the window runs past midnight.'), lm, own, h('label', { class: 'switch' }, off, 'Enabled'),
+      h('label', { class: 'switch', title: 'Turn this off for exams or other nights that should never be paused.' }, canPause, 'Earned free time can pause this window'), err,
       h('div', { class: 'actions' },
         !isNew ? h('button', { class: 'btn danger', type: 'button', style: 'margin-right:auto', onclick: async () => { if (await confirmBox(`Delete “${w.name}”?`, 'It is removed from the schedule.')) { close(true); edit(c => { c.windows = c.windows.filter(x => x.id !== w.id); }); } } }, 'Delete') : null,
         h('button', { class: 'btn ghost', type: 'button', onclick: () => close(false) }, 'Cancel'), h('button', { class: 'btn primary', type: 'submit' }, 'Save')));
@@ -363,14 +407,14 @@ function appsPane() {
 }
 
 /* ---------- parent area ---------- */
-const KIND = { window: ['Window', ''], 'blocked-app': ['App closed', ''], tamper: ['Tamper', 'bad'], auth: ['Passcode', ''], update: ['Update', ''], config: ['Settings', ''], service: ['Service', ''], error: ['Error', 'bad'] };
-const FILTERS = { all: [], windows: ['window'], blocks: ['blocked-app'], tamper: ['tamper', 'error'], updates: ['update'], security: ['auth', 'config', 'service'] };
+const KIND = { window: ['Window', ''], 'blocked-app': ['App closed', ''], tamper: ['Tamper', 'bad'], auth: ['Passcode', ''], update: ['Update', ''], config: ['Settings', ''], service: ['Service', ''], error: ['Error', 'bad'], reward: ['Free time', ''] };
+const FILTERS = { all: [], windows: ['window'], blocks: ['blocked-app'], rewards: ['reward'], tamper: ['tamper', 'error'], updates: ['update'], security: ['auth', 'config', 'service'] };
 function pageParent(view) {
   view.append(h('div', { class: 'titlerow' }, h('h1', {}, 'Parent area')));
   if (!S.unlocked) { view.append(h('section', { class: 'card empty' }, h('p', {}, 'The activity log, update settings and passcode controls are behind the parent passcode.'), h('div', { style: 'margin-top:14px' }, h('button', { class: 'btn primary', onclick: unlock }, 'Unlock')))); return; }
   const body = h('div', { style: 'display:grid;gap:var(--gap)' }, h('p', { class: 'empty' }, 'Loading…'));
-  view.append(h('div', { class: 'tabs', role: 'tablist' }, [['activity', 'Activity log'], ['updates', 'Updates'], ['security', 'Security']].map(([k, l]) => h('button', { role: 'tab', 'aria-selected': String(S.parentTab === k), onclick: () => { S.parentTab = k; render(); } }, l))), body);
-  const tab = S.parentTab, tabs = { activity: activityTab, updates: updatesTab, security: securityTab };
+  view.append(h('div', { class: 'tabs', role: 'tablist' }, [['activity', 'Activity log'], ['rewards', 'Free time'], ['updates', 'Updates'], ['security', 'Security']].map(([k, l]) => h('button', { role: 'tab', 'aria-selected': String(S.parentTab === k), onclick: () => { S.parentTab = k; render(); } }, l))), body);
+  const tab = S.parentTab, tabs = { activity: activityTab, rewards: rewardsTab, updates: updatesTab, security: securityTab };
   tabs[tab](body).catch(e => { if (e.status === 401) { S.unlocked = false; render(); } else if (S.parentTab === tab) body.replaceChildren(h('p', { class: 'err' }, e.message)); });
 }
 async function activityTab(body) {
@@ -382,6 +426,45 @@ async function activityTab(body) {
     h('p', { class: 'muted', style: 'margin-bottom:8px' }, `${closed} app closures and ${tamper} tamper events in the retained log.`),
     (rows || []).length ? h('div', { class: 'tablewrap' }, h('table', { class: 'log' }, h('thead', {}, h('tr', {}, h('th', {}, 'When'), h('th', {}, 'Type'), h('th', {}, 'What happened'))),
       h('tbody', {}, rows.map(r => { const [l, c] = KIND[r.kind] || [r.kind, '']; return h('tr', {}, h('td', {}, fmtStamp(r.t)), h('td', {}, h('span', { class: 'pill ' + c }, l)), h('td', {}, r.msg)); })))) : h('p', { class: 'empty' }, 'Nothing here yet.')));
+}
+// Parents give free time here (for the gym, homework, chores). Every grant asks for the passcode again.
+const QUICK = [['Gym', 30], ['Homework', 20], ['Chores', 15]];
+async function rewardsTab(body) {
+  await refreshStatus(); if (S.parentTab !== 'rewards') return;
+  const R = S.status.rewards;
+  const reason = h('input', { type: 'text', value: 'Gym', maxlength: 40, 'aria-label': 'What it is for' });
+  const amount = h('input', { type: 'number', min: 5, max: 120, step: 5, value: 30, 'aria-label': 'Minutes' });
+  const valid = h('select', { 'aria-label': 'How long it stays valid' }, [['Tonight only', 1], ['2 days', 2], ['This week', 7]].map(([l, v]) => h('option', { value: v }, l)));
+  const err = h('p', { class: 'err', role: 'alert' });
+  const chips = QUICK.map(([r, m]) => h('button', { class: 'chip', type: 'button', onclick: () => { reason.value = r; amount.value = m; } }, `${r} · ${m} min`));
+  const form = h('form', { style: 'display:grid;gap:12px', onsubmit: async e => {
+    e.preventDefault(); err.textContent = '';
+    const minutes = Number(amount.value), why = reason.value.trim() || 'Reward', days = Number(valid.value);
+    if (!(minutes >= 5 && minutes <= 120)) { err.textContent = 'Pick between 5 and 120 minutes.'; return; }
+    const ok = await askPasscode({ title: `Give ${minutes} minutes of free time?`, body: `For “${why}”. It can pause focus time ${days === 1 ? 'until midnight tonight' : 'for ' + days + ' days'}.`, label: 'Give free time',
+      onSubmit: p => api('/api/rewards/grant', 'POST', { minutes, reason: why, days, passcode: p }) });
+    if (ok) { toast(`${minutes} minutes of free time given`); render(); }
+  } },
+    h('div', { class: 'row' }, chips),
+    h('div', { class: 'row' }, h('label', { class: 'field grow' }, h('span', {}, 'What it is for'), reason), h('label', { class: 'field' }, h('span', {}, 'Minutes'), amount), h('label', { class: 'field' }, h('span', {}, 'Valid'), valid)),
+    err, h('div', {}, h('button', { class: 'btn primary', type: 'submit' }, 'Give free time')));
+  const capNow = S.cfg.rewardCapMinutes || R.capMin; // the edit shows at once; the status catches up after the save
+  const cap = h('input', { type: 'number', min: 5, max: 600, step: 5, value: capNow, 'aria-label': 'Most free time per day', style: 'width:90px',
+    onchange: e => { const v = Math.round(Number(e.target.value)); if (!(v >= 5 && v <= 600)) { toast('Pick between 5 and 600 minutes.', 'bad'); e.target.value = capNow; return; } edit(c => { c.rewardCapMinutes = v; }); } });
+  const rows = R.items.length ? h('ul', { class: 'rows' }, R.items.map(i => h('li', {}, h('b', {}, i.reason), h('span', { class: 't' }, `${wholeMin(i.left)} min left · until ${fmtDate(i.expires)} ${fmtTime(i.expires)}`),
+    h('button', { class: 'btn small danger', 'aria-label': `Take back ${i.reason}`, onclick: async () => {
+      if (!(await confirmBox('Take back this free time?', `${wholeMin(i.left)} unused minutes for “${i.reason}” are removed.`, 'Take back'))) return;
+      try { await api('/api/rewards/revoke', 'POST', { id: i.id }); toast('Taken back'); render(); } catch (ex) { toast(ex.message, 'bad'); }
+    } }, 'Take back')))) : h('p', { class: 'empty' }, 'Nothing saved up right now.');
+  body.replaceChildren(
+    h('section', { class: 'card' }, h('h2', {}, 'Give free time'),
+      h('p', { class: 'muted', style: 'margin-bottom:12px' }, 'A reward for going to the gym, finishing homework, or anything else. The child spends it from the Today page to pause focus time; whatever they do not use stays saved until it expires.'), form),
+    h('div', { class: 'cols' },
+      h('section', { class: 'card' }, h('h2', {}, 'Saved up'), rows),
+      h('section', { class: 'card', style: 'display:grid;gap:12px' }, h('h2', {}, 'Today'),
+        h('div', { class: 'kpis', style: 'grid-template-columns:repeat(2,1fr)' }, kpi('Given today', String(R.grantedToday), `of ${capNow} min`), kpi('Reward streak', String(R.streak), R.streak === 1 ? 'day' : 'days')),
+        h('label', { class: 'field' }, h('span', {}, 'Most free time you can give in one day (minutes)'), cap),
+        h('p', { class: 'faint' }, 'A window can opt out of this in its settings, for exam nights.'))));
 }
 async function updatesTab(body) {
   const u = await api('/api/updates'); if (S.parentTab !== 'updates') return;
@@ -402,7 +485,13 @@ async function securityTab(body) {
     try { await api('/api/auth/change', 'POST', { old: o.value, new: n.value }); toast('Passcode changed'); o.value = n.value = n2.value = ''; } catch (ex) { err.textContent = ex.message; } } },
     h('label', { class: 'field' }, h('span', {}, 'Current passcode'), o), h('label', { class: 'field' }, h('span', {}, 'New passcode (6 or more characters)'), n), h('label', { class: 'field' }, h('span', {}, 'New passcode again'), n2), err, h('div', {}, h('button', { class: 'btn primary', type: 'submit' }, 'Change passcode')));
   const stop = h('button', { class: 'btn danger', onclick: async () => { if (await askPasscode({ title: 'Stop Focus Guard?', body: 'Blocking stops until the PC restarts or the service is started again. The log records this.', label: 'Stop it', danger: true, onSubmit: p => api('/api/service/stop', 'POST', { passcode: p }) })) toast('Stopping…'); } }, 'Stop Focus Guard');
+  const zone = h('input', { type: 'text', list: 'zones', value: S.cfg.timezone || BROWSER_ZONE, 'aria-label': 'Time zone' });
+  const zones = h('datalist', { id: 'zones' }, (Intl.supportedValuesOf ? Intl.supportedValuesOf('timeZone') : []).map(z => h('option', { value: z })));
+  const zoneForm = h('form', { style: 'display:grid;gap:12px', onsubmit: e => { e.preventDefault(); const z = zone.value.trim(); if (z && edit(c => { c.timezone = z; })) toast('Time zone saved'); } },
+    h('p', { class: 'muted' }, `Windows follow ${S.cfg.timezone || 'this PC'}${S.cfg.timezone ? ', no matter what the Windows time zone is set to' : ''}. Pinning stops a time zone change from moving a window.`),
+    h('label', { class: 'field' }, h('span', {}, 'Time zone'), zone, zones), h('div', {}, h('button', { class: 'btn', type: 'submit' }, 'Save time zone')));
   body.replaceChildren(h('div', { class: 'cols' }, h('section', { class: 'card' }, h('h2', {}, 'Parent passcode'), form),
+    h('section', { class: 'card' }, h('h2', {}, 'Time zone'), zoneForm),
     h('section', { class: 'card', style: 'display:grid;gap:12px' }, h('h2', {}, 'Session'), h('p', { class: 'muted' }, 'The dashboard locks itself after 10 idle minutes.'), h('div', {}, h('button', { class: 'btn', onclick: toggleLock }, 'Lock now')),
       h('h2', { style: 'margin-top:12px' }, 'Service'), h('p', { class: 'muted' }, 'Stopping needs the passcode. Windows administrators can still stop the service from the system.'), h('div', {}, stop),
       h('p', { class: 'faint' }, 'The lock is only strong if the everyday Windows account is a standard (non-admin) account.'))));
@@ -426,12 +515,12 @@ let lastSig = '';
 async function poll() {
   try { await refreshStatus(); } catch { return; }
   if (!$('#view')) return;
-  const s = S.status, sig = JSON.stringify([s.blocking, s.active.map(a => a.key), s.next?.key, s.today.map(o => o.key + o.ended), s.streak, Math.floor(s.focusHoursToday * 30), s.siteBlocksToday, s.appBlocksToday, s.sites, s.apps, s.problem, S.unlocked]);
+  const s = S.status, sig = JSON.stringify([s.blocking, s.active.map(a => a.key), s.next?.key, s.today.map(o => o.key + o.ended), s.streak, Math.floor(s.focusHoursToday * 30), s.siteBlocksToday, s.appBlocksToday, s.sites, s.apps, s.problem, s.notice, S.unlocked, s.paused.map(a => a.key), s.rewards.balanceSec, s.rewards.break?.until, s.rewards.canPause, s.rewards.streak]);
   paintChrome();
   if (sig !== lastSig) { lastSig = sig; if (S.route === 'today') render(); }
   maybeUninstallPrompt();
 }
-function start() { theme(false); buildShell(); route(); maybeUninstallPrompt(); }
+function start() { theme(false); buildShell(); route(); maybeUninstallPrompt(); ensureZone(); }
 theme(false);
 if (!S.setup) welcome(); else start();
 setInterval(poll, 3000); setInterval(tick, 1000);

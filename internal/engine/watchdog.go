@@ -16,14 +16,7 @@ func (e *Engine) siteLoop(ctx context.Context) {
 	t := time.NewTicker(WatchdogInterval)
 	defer t.Stop()
 	for {
-		e.mu.Lock()
-		w := e.want
-		e.mu.Unlock()
-		repaired, err := e.Sites.Reconcile(w.domains, w.until)
-		if len(repaired) > 0 {
-			e.Tamper("Website block was altered (" + strings.Join(repaired, ", ") + "); restored")
-		}
-		e.setProblem("site blocking", err)
+		e.safely("website watchdog", e.sitePass)
 		select {
 		case <-ctx.Done():
 			return
@@ -31,6 +24,17 @@ func (e *Engine) siteLoop(ctx context.Context) {
 		case <-e.siteWake:
 		}
 	}
+}
+
+func (e *Engine) sitePass() {
+	e.mu.Lock()
+	w := e.want
+	e.mu.Unlock()
+	repaired, err := e.Sites.Reconcile(w.domains, w.until)
+	if len(repaired) > 0 {
+		e.Tamper("Website block was altered (" + strings.Join(repaired, ", ") + "); restored")
+	}
+	e.setProblem("site blocking", err)
 }
 
 // setProblem keeps the latest enforcement problem for the dashboard and
@@ -70,9 +74,12 @@ func (e *Engine) syncLoop(ctx context.Context) {
 		case <-time.After(wait):
 		case <-e.syncNow:
 		}
-		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		err := e.Clock.Sync(sctx)
-		cancel()
+		var err error
+		e.safely("clock sync", func() {
+			sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			err = e.Clock.Sync(sctx)
+		})
 		if err != nil { // offline: the local clock stays in charge
 			failures++
 			wait = time.Minute

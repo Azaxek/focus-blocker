@@ -10,11 +10,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Azaxek/focus-blocker/internal/apps"
 	"github.com/Azaxek/focus-blocker/internal/fsx"
+	"github.com/Azaxek/focus-blocker/internal/rewards"
 	"github.com/Azaxek/focus-blocker/internal/schedule"
 	"github.com/Azaxek/focus-blocker/internal/sites"
 )
@@ -32,6 +34,21 @@ type Config struct {
 	Apps       []string          `json:"apps"`     // global blocked app rule ids
 	AppRules   []apps.Rule       `json:"appRules"` // every known rule: presets + custom
 	AutoUpdate bool              `json:"autoUpdate"`
+	// RewardCapMinutes is the most free time a parent can grant in one day (0 = the default, 60).
+	RewardCapMinutes int `json:"rewardCapMinutes,omitempty"`
+}
+
+const (
+	DefaultRewardCap = 60
+	MaxRewardCap     = 600
+)
+
+// RewardCap is the daily limit on granted free time, in minutes.
+func (c Config) RewardCap() int {
+	if c.RewardCapMinutes <= 0 {
+		return DefaultRewardCap
+	}
+	return c.RewardCapMinutes
 }
 
 type DayStat struct {
@@ -39,6 +56,7 @@ type DayStat struct {
 	SiteBlocks int `json:"siteBlocks"`
 	AppBlocks  int `json:"appBlocks"`
 	EndedEarly int `json:"endedEarly"`
+	RewardMin  int `json:"rewardMin,omitempty"` // free time granted that day
 }
 
 type State struct {
@@ -46,6 +64,7 @@ type State struct {
 	Days            map[string]*DayStat  `json:"days"`
 	LastCheck       time.Time            `json:"lastCheck"`
 	LastCheckResult string               `json:"lastCheckResult"`
+	Rewards         rewards.Ledger       `json:"rewards"`
 }
 
 type Entry struct {
@@ -60,6 +79,10 @@ type Store struct {
 	cfg Config
 	st  State
 	lg  sync.Mutex
+
+	// Notice is set when a damaged file had to be restored or replaced; the
+	// dashboard shows it so a parent notices.
+	Notice string
 }
 
 func Default() Config {
@@ -77,16 +100,35 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir}
-	if err := readJSON(filepath.Join(dir, "config.json"), &s.cfg); errors.Is(err, os.ErrNotExist) {
-		s.cfg = Default()
-		if err := s.saveConfig(); err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, fmt.Errorf("config.json is damaged: %w", err)
+	var problems []string
+	cfg, how, err := load[Config](filepath.Join(dir, "config.json"))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		cfg = Default()
+	case err != nil:
+		// A service that refuses to start blocks nothing, so start from the defaults and say so loudly.
+		cfg = Default()
+		problems = append(problems, "The settings file was damaged and so was its backup, so Focus Guard started from the defaults (the damaged file was kept as config.json.damaged). Re-create the schedule.")
+	case how != "":
+		problems = append(problems, "The settings file was damaged or missing; the last good copy was restored (a damaged file is kept as config.json.damaged).")
 	}
-	if err := readJSON(filepath.Join(dir, "state.json"), &s.st); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("state.json is damaged: %w", err)
+	s.cfg = cfg
+	if err := s.saveConfig(); err != nil { // also (re)writes the .bak copy
+		return nil, err
+	}
+	st, how, err := load[State](filepath.Join(dir, "state.json"))
+	switch {
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		problems = append(problems, "The statistics file was damaged and was reset (kept as state.json.damaged).")
+	case how != "":
+		problems = append(problems, "The statistics file was damaged; the last good copy was restored.")
+	}
+	s.st = st
+	if len(problems) > 0 {
+		s.Notice = strings.Join(problems, " ")
+		for _, p := range problems {
+			s.Log(time.Now(), "error", p)
+		}
 	}
 	if s.st.Ended == nil {
 		s.st.Ended = map[string]time.Time{}
@@ -115,12 +157,37 @@ func readJSON(path string, v any) error {
 	return json.Unmarshal(b, v)
 }
 
+// load reads path; if the file is damaged it falls back to the last good copy
+// (path+".bak"), keeping the damaged one aside as path+".damaged". `how` is
+// "backup" when that happened. When both are unusable the error is returned and
+// the damaged file is still moved aside, so the next save cannot destroy it.
+func load[T any](path string) (v T, how string, err error) {
+	err = readJSON(path, &v)
+	if err == nil {
+		return v, "", nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		os.Rename(path, path+".damaged")
+	}
+	var bak T
+	if berr := readJSON(path+".bak", &bak); berr != nil {
+		var zero T
+		return zero, "", err
+	}
+	return bak, "backup", nil
+}
+
+// writeJSON saves atomically and keeps a copy of the last good write as path+".bak".
 func writeJSON(path string, v any) error {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return fsx.WriteAtomic(path, b)
+	if err := fsx.WriteAtomic(path, b); err != nil {
+		return err
+	}
+	fsx.WriteAtomic(path+".bak", b) // best effort: the main file is already safe
+	return nil
 }
 
 func (s *Store) saveConfig() error { return writeJSON(filepath.Join(s.dir, "config.json"), s.cfg) }
@@ -166,6 +233,9 @@ func Validate(c Config) (Config, error) {
 	c.Version = schemaVersion
 	if len(c.Windows) > 200 || len(c.Sites) > 3000 || len(c.AppRules) > 300 {
 		return c, errors.New("too many entries")
+	}
+	if c.RewardCapMinutes < 0 || c.RewardCapMinutes > MaxRewardCap {
+		return c, fmt.Errorf("the daily free-time limit must be between 0 and %d minutes", MaxRewardCap)
 	}
 	if c.Timezone != "" {
 		if _, err := time.LoadLocation(c.Timezone); err != nil {
@@ -242,7 +312,7 @@ func (c Config) Rules(ids []string) []apps.Rule {
 func (s *Store) State() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := State{Ended: map[string]time.Time{}, Days: map[string]*DayStat{}, LastCheck: s.st.LastCheck, LastCheckResult: s.st.LastCheckResult}
+	cp := State{Ended: map[string]time.Time{}, Days: map[string]*DayStat{}, LastCheck: s.st.LastCheck, LastCheckResult: s.st.LastCheckResult, Rewards: s.st.Rewards.Clone()}
 	for k, v := range s.st.Ended {
 		cp.Ended[k] = v
 	}
@@ -251,6 +321,13 @@ func (s *Store) State() State {
 		cp.Days[k] = &d
 	}
 	return cp
+}
+
+// Ledger is a copy of the free-time ledger (cheap, unlike State).
+func (s *Store) Ledger() rewards.Ledger {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.st.Rewards.Clone()
 }
 
 // UpdateState mutates the state under the lock and saves it.

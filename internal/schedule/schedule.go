@@ -21,6 +21,7 @@ type Window struct {
 	Sites    []string `json:"sites,omitempty"` // own list: domains
 	Apps     []string `json:"apps,omitempty"`  // own list: app rule IDs
 	Disabled bool     `json:"disabled,omitempty"`
+	NoBreak  bool     `json:"noBreak,omitempty"` // earned free time cannot pause this window (exam nights)
 }
 
 type Occurrence struct {
