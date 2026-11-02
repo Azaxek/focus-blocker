@@ -31,7 +31,7 @@ var version = "dev"
 const repo = "Azaxek/focus-blocker"
 
 // releasePubKey is the Ed25519 key that signs releases (see tools/keygen).
-const releasePubKey = "wswYQZ/IuM7ueueJe6ycqYugZ7VgpWv9HpTbFuW8rjA="
+const releasePubKey = "UoDPK90ctsUrLdhWvwT/G+lfiPsIKWXZgXFhJR4OIV0="
 
 func pubKey() ed25519.PublicKey {
 	b, err := base64.StdEncoding.DecodeString(releasePubKey)
