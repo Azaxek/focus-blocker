@@ -18,6 +18,8 @@ type Blocker struct {
 	appliedAt    time.Time
 	scriptAt     time.Time
 	scriptFailed bool
+	dropAt       time.Time // last time open connections to blocked sites were cut
+	drop         liveDrop
 }
 
 func NewBlocker(sink *Sinkhole) *Blocker {
@@ -60,7 +62,14 @@ func (b *Blocker) Reconcile(domains []string, until time.Time) (repaired []strin
 		errs = append(errs, b.fix(domains, "hosts", "policy", "nrpt", "firewall"))
 		b.applied, b.appliedAt = fp, time.Now()
 		flushDNS()
+		b.dropAt = time.Now()
+		go b.dropLive(fp, domains)
 		return nil, errors.Join(errs...)
+	}
+	// a browser can still open a connection from its own cached lookup for a little while
+	if time.Since(b.appliedAt) < 2*time.Minute && time.Since(b.dropAt) > 10*time.Second {
+		b.dropAt = time.Now()
+		go b.dropLive(fp, domains)
 	}
 	bad := b.verify(domains)
 	if len(bad) > 0 {

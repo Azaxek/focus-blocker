@@ -48,8 +48,17 @@ class ApiError extends Error { constructor(m, code, status) { super(m); this.cod
 async function api(path, method = 'GET', body) {
   const res = await fetch(path, { method, credentials: 'same-origin', headers: { 'X-FG-Token': token, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) }, body: body !== undefined ? JSON.stringify(body) : undefined });
   let data = null; try { data = await res.json(); } catch { /* empty body */ }
-  if (!res.ok) throw new ApiError(data?.error || res.statusText, data?.code, res.status);
+  if (data?.code === 'token') staleWindow();
+  if (!res.ok) throw new ApiError(data?.code === 'token' ? 'Focus Guard was restarted. Reload this window and try again.' : data?.error || res.statusText, data?.code, res.status);
   return data;
+}
+// The page token is new each time the service starts, so a window left open across an update or a
+// reinstall holds a dead one. Load the page again to get the live token, but never twice in a row.
+function staleWindow() {
+  let last = 0; try { last = +sessionStorage.getItem('fg-reload') || 0; } catch { /* storage may be blocked */ }
+  if (Date.now() - last < 15000) return;
+  try { sessionStorage.setItem('fg-reload', String(Date.now())); } catch { /* ignore */ }
+  toast('Focus Guard was restarted. Reloading…'); setTimeout(() => location.reload(), 800);
 }
 function toast(msg, kind = '') { const t = h('div', { class: 'toast ' + kind }, msg); $('#toasts').append(t); setTimeout(() => t.remove(), 4500); }
 
@@ -204,13 +213,17 @@ function pageToday(view) {
     : free ? (next ? `Next: ${next.name}, ${fmtDate(next.start)} at ${fmtTime(next.start)}.` : 'No focus time is scheduled.')
     : `${s.active.map(a => a.name).join(' and ')} is on until ${fmtTime(s.until)}. ${s.sites} sites and ${s.apps} apps are blocked.`;
   view.append(h('div', { class: 'titlerow' }, h('h1', {}, 'Today'), h('p', {}, finding)));
+  const endedNow = s.today.filter(o => o.ended && Date.parse(o.start) <= nowMs() && Date.parse(o.end) > nowMs()); // ended early, still within its time
   const [fd, fdu] = hrs(s.focusHoursToday), [fw, fwu] = hrs(s.focusHoursWeek);
   view.append(h('section', { class: 'card status', 'aria-label': 'Current status' },
     h('div', { class: 'word' }, free ? 'Free time' : 'Blocking'),
     h('div', { class: 'clock', id: 'clock', 'aria-hidden': 'true' }, '--:--'), h('div', { class: 'muted', id: 'clocksub' }),
     !free ? h('div', { class: 'track', role: 'progressbar', 'aria-label': 'Time elapsed in this window' }, h('i', { id: 'prog' })) : null,
+    s.quote ? h('p', { class: 'quote' }, s.quote) : null,
     onBreak && free ? h('div', {}, h('button', { class: 'btn primary', onclick: backToFocus }, 'Back to focus now')) : null,
-    !free ? h('div', {}, h('button', { class: 'btn danger', onclick: () => endEarly(s.active) }, 'End early (parent)')) : null));
+    !free ? h('div', {}, h('button', { class: 'btn danger', onclick: () => endEarly(s.active) }, 'End early (parent)')) : null,
+    endedNow.length ? h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: ev => resume(endedNow, ev.currentTarget) },
+      endedNow.length === 1 ? `Turn “${endedNow[0].name}” back on` : 'Turn focus time back on'), h('span', { class: 'muted' }, 'It was ended early.')) : null));
   const ft = freeTimeCard(s);
   if (ft) view.append(ft);
   view.append(h('section', { class: 'card kpis', 'aria-label': 'Summary' },
@@ -251,6 +264,12 @@ async function backToFocus() {
   try { const r = await api('/api/rewards/end', 'POST', {}); await refreshStatus(); render(); toast(`Back to focus. ${wholeMin(r.savedSeconds)} min saved for later.`); }
   catch (e) { toast(e.message, 'bad'); await refreshStatus().catch(() => {}); render(); }
 }
+// Turning blocking back on only makes things stricter, so it needs no passcode.
+async function resume(list, btn) {
+  btn.disabled = true;
+  try { await Promise.all(list.map(o => api('/api/windows/resume', 'POST', { key: o.key }))); await refreshStatus(); render(); toast('Focus time is back on'); }
+  catch (e) { btn.disabled = false; toast(e.message, 'bad'); await refreshStatus().catch(() => {}); render(); }
+}
 async function endEarly(active) {
   let target = active[0];
   if (active.length > 1) {
@@ -259,7 +278,10 @@ async function endEarly(active) {
     if (!target) return;
   }
   const ok = await askPasscode({ title: `End “${target.name}” early?`, body: 'Blocking stops for this one occurrence only, and the activity log records it.', label: 'End early', danger: true,
-    onSubmit: p => api('/api/windows/end', 'POST', { key: target.key, passcode: p }) });
+    onSubmit: async p => { // a locked dashboard signs in with the same passcode, so a parent types it once
+      if (!S.unlocked) { await api('/api/auth/login', 'POST', { passcode: p }); S.unlocked = true; paintChrome(); }
+      return api('/api/windows/end', 'POST', { key: target.key, passcode: p });
+    } });
   if (ok) { await refreshStatus(); render(); toast('Window ended early'); }
 }
 let refreshing = false;

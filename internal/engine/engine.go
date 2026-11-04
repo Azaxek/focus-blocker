@@ -12,6 +12,7 @@ import (
 
 	"github.com/Azaxek/focus-blocker/internal/apps"
 	"github.com/Azaxek/focus-blocker/internal/clock"
+	"github.com/Azaxek/focus-blocker/internal/quotes"
 	"github.com/Azaxek/focus-blocker/internal/schedule"
 	"github.com/Azaxek/focus-blocker/internal/store"
 )
@@ -45,8 +46,9 @@ type Engine struct {
 	mu       sync.Mutex
 	ended    map[string]bool
 	active   map[string]schedule.Occurrence
-	blocking bool            // something was actually being enforced at the last tick
-	warned   map[string]bool // heads-up notices already sent
+	blocking bool                 // something was actually being enforced at the last tick
+	warned   map[string]bool      // heads-up notices already sent
+	noted    map[string]time.Time // when a pop-up for a blocked app or site was last queued
 	want     siteWant
 	events   []Event
 	nextID   int
@@ -69,7 +71,7 @@ type siteWant struct {
 
 func New(version string, st *store.Store, clk *clock.Clock, sites SiteBlocker, ap AppBlocker) *Engine {
 	e := &Engine{Version: version, Store: st, Clock: clk, Sites: sites, Apps: ap,
-		ended: map[string]bool{}, active: map[string]schedule.Occurrence{}, lastErr: map[string]time.Time{}, warned: map[string]bool{},
+		ended: map[string]bool{}, active: map[string]schedule.Occurrence{}, lastErr: map[string]time.Time{}, warned: map[string]bool{}, noted: map[string]time.Time{},
 		wake: make(chan struct{}, 1), siteWake: make(chan struct{}, 1), syncNow: make(chan struct{}, 1), nextID: 1}
 	for k := range st.State().Ended {
 		e.ended[k] = true
@@ -166,7 +168,7 @@ func (e *Engine) tick() {
 
 	for _, o := range started {
 		e.Store.Log(now, "window", fmt.Sprintf("Started “%s” until %s", o.Window.Name, o.End.In(loc).Format("Mon 3:04 PM")))
-		e.event("window-start", "Focus time started", fmt.Sprintf("%s — until %s", o.Window.Name, o.End.In(loc).Format("3:04 PM")))
+		e.event("window-start", "Focus time started", fmt.Sprintf("%s until %s. %s", o.Window.Name, o.End.In(loc).Format("3:04 PM"), quotes.Random(quotes.Start)))
 	}
 	for _, o := range finished {
 		e.mu.Lock()
@@ -174,7 +176,7 @@ func (e *Engine) tick() {
 		e.mu.Unlock()
 		if !early {
 			e.Store.Log(now, "window", fmt.Sprintf("Ended “%s”", o.Window.Name))
-			e.event("window-end", "Free time", fmt.Sprintf("“%s” is over", o.Window.Name))
+			e.event("window-end", "Free time", fmt.Sprintf("“%s” is over. %s", o.Window.Name, quotes.Random(quotes.Done)))
 		}
 	}
 	if summary != "" {
@@ -192,7 +194,9 @@ func (e *Engine) tick() {
 		e.mu.Unlock()
 		e.Store.UpdateState(func(s *store.State) { s.Day(dayKey(now, loc)).AppBlocks++ })
 		e.Store.Log(now, "blocked-app", fmt.Sprintf("Closed %s (%s)", k.Name, k.Rule))
-		e.event("app-closed", k.Rule+" is blocked", "Closed during your focus time.")
+		if e.due("app:"+k.Rule, 30*time.Second) { // a program that keeps relaunching gets one pop-up, not one a second
+			e.event("app-closed", k.Rule+" is blocked", quotes.Random(quotes.Block))
+		}
 	}
 
 	if e.Clock != nil && time.Since(e.lastSave) > time.Minute {
@@ -282,6 +286,25 @@ func (e *Engine) SiteAttempt(domain string) {
 	e.Store.UpdateState(func(s *store.State) { s.Day(dayKey(now, loc)).SiteBlocks++ })
 }
 
+// BlockedNow is the list of domains being blocked at this moment. The tray uses it
+// to tell whether a browser tab is showing a blocked site.
+func (e *Engine) BlockedNow() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string{}, e.want.domains...)
+}
+
+// due reports whether key has not been used in the last gap, and marks it used.
+func (e *Engine) due(key string, gap time.Duration) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if time.Since(e.noted[key]) < gap {
+		return false
+	}
+	e.noted[key] = time.Now()
+	return true
+}
+
 // EndEarly ends one active occurrence (the caller has checked the passcode).
 func (e *Engine) EndEarly(key string) error {
 	e.mu.Lock()
@@ -303,6 +326,35 @@ func (e *Engine) EndEarly(key string) error {
 	e.mu.Unlock()
 	e.Store.Log(now, "window", fmt.Sprintf("Ended “%s” early (passcode)", o.Window.Name))
 	e.event("window-end", "Ended early", o.Window.Name)
+	e.Wake()
+	return nil
+}
+
+// Resume turns a window that was ended early back on for the rest of its time.
+// It only makes things stricter, so unlike EndEarly it needs no passcode. The
+// early end stays on the day's record: the streak is not given back.
+func (e *Engine) Resume(key string) error {
+	now := e.Clock.Now()
+	cfg := e.Store.Config()
+	var o *schedule.Occurrence
+	for _, c := range schedule.Occurrences(cfg.Windows, now, now.Add(time.Nanosecond), cfg.Location()) {
+		if c.Key() == key && !c.Start.After(now) {
+			o = &c
+		}
+	}
+	e.mu.Lock()
+	ended := e.ended[key]
+	e.mu.Unlock()
+	if o == nil || !ended {
+		return errors.New("that window was not ended early, or it is already over")
+	}
+	if err := e.Store.UpdateState(func(s *store.State) { delete(s.Ended, key) }); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	delete(e.ended, key)
+	e.mu.Unlock()
+	e.Store.Log(now, "window", fmt.Sprintf("Turned “%s” back on", o.Window.Name))
 	e.Wake()
 	return nil
 }

@@ -13,13 +13,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
+	"github.com/Azaxek/focus-blocker/internal/apps"
+	"github.com/Azaxek/focus-blocker/internal/quotes"
 	"github.com/Azaxek/focus-blocker/internal/server"
 )
 
@@ -128,6 +132,7 @@ func get(path string, v any) error {
 func poll(state *systray.MenuItem) {
 	last := 0
 	first := true
+	shown := map[string]time.Time{} // when each blocked site last got a pop-up
 	for ; ; time.Sleep(2 * time.Second) {
 		var st statusResp
 		if err := get("/api/status", &st); err != nil {
@@ -152,12 +157,20 @@ func poll(state *systray.MenuItem) {
 		if get(fmt.Sprintf("/api/events?after=%d", last), &evs) == nil {
 			for _, e := range evs {
 				last = e.ID
-				if !first { // don't replay history when the tray starts
+				if first { // don't replay history when the tray starts
+					continue
+				}
+				if e.Kind == "app-closed" {
+					Popup(e.Title, e.Body)
+				} else {
 					Toast(e.Title, e.Body)
 				}
 			}
 		}
 		first = false
+		if st.Status.Blocking {
+			sitePopup(shown)
+		}
 	}
 }
 
@@ -183,6 +196,79 @@ $id = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.
 	cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
 	go cmd.Run()
+}
+
+var popupUp atomic.Bool
+
+// Popup puts a message box on top of whatever is on screen, for the moments a
+// toast could be missed (a full-screen game, Do Not Disturb). One at a time.
+func Popup(title, body string) {
+	if !popupUp.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer popupUp.Store(false)
+		t, _ := windows.UTF16PtrFromString("Stay hard.")
+		b, _ := windows.UTF16PtrFromString(title + "\n\n" + body)
+		windows.MessageBox(0, b, t, 0x40|0x10000|0x40000) // information icon, foreground, topmost
+	}()
+}
+
+// A blocked-site pop-up has to mean "you went there". Background programs and
+// pages look blocked names up all day (one tab alone can do it every minute), so a
+// lookup proves nothing. What does prove it: Chrome and Edge title the "can't be
+// reached" page with the address itself, "www.youtube.com - Profile 1 - Microsoft
+// Edge", while a page that loaded has its own title. So the pop-up appears only when
+// the window in front is a browser showing exactly that.
+// ponytail: Firefox titles its error page "Problem loading page", so it gets no pop-up.
+func sitePopup(shown map[string]time.Time) {
+	host := titleHost(foregroundBrowserTitle())
+	if host == "" || time.Since(shown[host]) < 30*time.Second {
+		return
+	}
+	var blocked []string
+	if get("/api/blocked", &blocked) != nil || !isBlocked(host, blocked) {
+		return
+	}
+	shown[host] = time.Now()
+	Popup(host+" is blocked", quotes.Random(quotes.Block))
+}
+
+// foregroundBrowserTitle is the title of the window in front, or "" when it is not a browser.
+func foregroundBrowserTitle() string {
+	h := windows.GetForegroundWindow()
+	var pid uint32
+	windows.GetWindowThreadProcessId(h, &pid)
+	if pid == 0 || !apps.IsBrowser(apps.ImagePath(pid)) {
+		return ""
+	}
+	buf := make([]uint16, 512)
+	n, _, _ := getWindowText.Call(uintptr(h), uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return windows.UTF16ToString(buf[:n])
+}
+
+var getWindowText = windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowTextW")
+
+// titleHost pulls an address out of a window title ("www.youtube.com - Edge" gives
+// "www.youtube.com"), or "" when the title is an ordinary page title.
+func titleHost(title string) string {
+	host, _, _ := strings.Cut(title, " - ")
+	host = strings.TrimSpace(host)
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(host, "https://"), "http://"), "/"))
+	if !strings.Contains(host, ".") || strings.ContainsAny(host, " /") {
+		return ""
+	}
+	return host
+}
+
+// isBlocked reports whether host is one of the blocked domains or a subdomain of one.
+func isBlocked(host string, blocked []string) bool {
+	for _, d := range blocked {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 func browser() string {

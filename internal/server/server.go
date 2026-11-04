@@ -97,6 +97,7 @@ func (s *Server) Handler() http.Handler {
 	public("GET /api/status", s.status)
 	public("GET /api/config", s.getConfig)
 	public("GET /api/events", s.events)
+	public("GET /api/blocked", func(w http.ResponseWriter, r *http.Request) { send(w, s.Eng.BlockedNow()) })
 	guarded("POST /api/auth/setup", s.setup)
 	guarded("POST /api/auth/login", s.login)
 	guarded("POST /api/auth/logout", s.logout)
@@ -105,6 +106,7 @@ func (s *Server) Handler() http.Handler {
 	guarded("GET /api/uninstall/status", s.uninstallStatus)
 	guarded("POST /api/rewards/redeem", s.redeemReward) // the child spends earned time: no passcode by design
 	guarded("POST /api/rewards/end", s.endBreak)        // ending a break only makes things stricter
+	guarded("POST /api/windows/resume", s.resumeWindow) // so does turning an early-ended window back on
 	secure("POST /api/rewards/grant", s.grantReward)    // and the parent re-enters the passcode for every grant
 	secure("POST /api/rewards/revoke", s.revokeReward)
 	secure("PUT /api/config", s.putConfig)
@@ -413,6 +415,20 @@ func (s *Server) endWindow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Eng.EndEarly(b.Key); err != nil {
+		fail(w, http.StatusBadRequest, err.Error(), "invalid")
+		return
+	}
+	send(w, map[string]bool{"ok": true})
+}
+
+func (s *Server) resumeWindow(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Key string `json:"key"`
+	}
+	if !decode(w, r, &b) {
+		return
+	}
+	if err := s.Eng.Resume(b.Key); err != nil {
 		fail(w, http.StatusBadRequest, err.Error(), "invalid")
 		return
 	}

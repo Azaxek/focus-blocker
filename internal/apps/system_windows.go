@@ -1,6 +1,7 @@
 package apps
 
 import (
+	"path/filepath"
 	"strings"
 	"sync"
 	"unsafe"
@@ -35,7 +36,7 @@ func (w *WinSystem) Procs() ([]Proc, error) {
 		seen[e.ProcessID] = true
 		c, ok := w.paths[e.ProcessID]
 		if !ok || c.name != name { // new process, or the pid was reused
-			c = pathEntry{name, imagePath(e.ProcessID)}
+			c = pathEntry{name, ImagePath(e.ProcessID)}
 			w.paths[e.ProcessID] = c
 		}
 		out = append(out, Proc{PID: e.ProcessID, PPID: e.ParentProcessID, Name: name, Path: c.path})
@@ -48,7 +49,13 @@ func (w *WinSystem) Procs() ([]Proc, error) {
 	return out, nil
 }
 
-func imagePath(pid uint32) string {
+var browserExes = map[string]bool{"chrome.exe": true, "msedge.exe": true, "firefox.exe": true, "brave.exe": true, "opera.exe": true, "vivaldi.exe": true}
+
+// IsBrowser reports whether an executable path is a web browser.
+func IsBrowser(path string) bool { return browserExes[strings.ToLower(filepath.Base(path))] }
+
+// ImagePath is the full path of the program a process runs ("" when it cannot be read).
+func ImagePath(pid uint32) string {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
 		return ""

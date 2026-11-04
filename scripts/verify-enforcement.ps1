@@ -41,7 +41,7 @@ foreach ($b in 'Google\Chrome', 'Microsoft\Edge') {
 }
 
 if ($blocking) {
-    Write-Host "`nNow open each blocked site in Chrome AND Edge: expect a connection error or the Stay-with-it page."
+    Write-Host "`nNow open each blocked site in Chrome AND Edge: expect a connection error or the "Stay hard." page."
     Write-Host "To test apps: start a blocked program; it should close within 2 seconds and a notification should appear."
 } else {
     Write-Host "`nNow open the same sites in Chrome and Edge: they should load normally."

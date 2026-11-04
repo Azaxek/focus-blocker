@@ -3,6 +3,7 @@ package engine
 import (
 	"time"
 
+	"github.com/Azaxek/focus-blocker/internal/quotes"
 	"github.com/Azaxek/focus-blocker/internal/schedule"
 	"github.com/Azaxek/focus-blocker/internal/store"
 )
@@ -39,6 +40,7 @@ type Status struct {
 	Notice    string      `json:"notice,omitempty"` // a damaged file was restored or reset
 	Paused    []OccView   `json:"paused"`           // windows a free-time break is pausing
 	Rewards   RewardsView `json:"rewards"`
+	Quote     string      `json:"quote"` // the line of the day
 }
 
 type RewardItem struct {
@@ -85,7 +87,7 @@ func (e *Engine) Status() Status {
 	dayStart := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, loc)
 	dayEnd := dayStart.AddDate(0, 0, 1)
 	s := Status{Version: e.Version, Now: now, Zone: loc.String(), DayStart: dayStart, DayEnd: dayEnd, Problem: problem, Notice: e.Store.Notice,
-		Active: []OccView{}, Paused: []OccView{}, Today: []OccView{}}
+		Active: []OccView{}, Paused: []OccView{}, Today: []OccView{}, Quote: quotes.ForDay(dayKey(now, loc))}
 	s.TimeSync, _ = e.Clock.Synced()
 
 	st := e.Store.State()

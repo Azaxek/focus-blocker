@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/Azaxek/focus-blocker/internal/quotes"
 )
 
 // canary makes Firefox decide encrypted DNS is unwanted on this network.
@@ -128,7 +130,7 @@ func (s *Sinkhole) page() http.Handler {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprintf(w, blockPage, html.EscapeString(host), html.EscapeString(when))
+		fmt.Fprintf(w, blockPage, html.EscapeString(quotes.Random(quotes.Block)), html.EscapeString(host), html.EscapeString(when))
 	})
 }
 
@@ -218,11 +220,13 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 sys
 main{max-width:30rem;padding:2rem;text-align:center}
 .ring{width:5rem;height:5rem;border-radius:50%%;margin:0 auto 1.5rem;background:conic-gradient(#6c8cff,#a06cff,#6c8cff);display:grid;place-items:center}
 .ring::after{content:"";width:3.4rem;height:3.4rem;border-radius:50%%;background:#0f1420}
-h1{font-size:1.6rem;margin:.2rem 0}
+h1{font-size:2.4rem;margin:.2rem 0;letter-spacing:.02em}
 p{color:#9aa6bf;margin:.4rem 0}
 b{color:#e8ecf4}
+.q{color:#e8ecf4;font-size:1.15rem;margin:1rem 0 1.6rem}
 </style>
 <main><div class="ring"></div>
-<h1>Stay with it</h1>
+<h1>Stay hard.</h1>
+<p class="q">%s</p>
 <p><b>%s</b> is blocked during your focus time.</p>
 <p>It opens again at <b>%s</b>.</p></main></html>`

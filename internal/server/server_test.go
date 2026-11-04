@@ -253,11 +253,21 @@ func TestEndingEarlyAsksForPasscodeAgain(t *testing.T) {
 	}
 }
 
+func TestResumingNeedsOnlyTheTokenButStillChecksTheWindow(t *testing.T) {
+	r := newRig(t)
+	if w := r.do("POST", "/api/windows/resume", map[string]string{"key": "x"}, func(q *http.Request) { q.Header.Del("X-FG-Token") }); w.Code != 403 {
+		t.Fatalf("no token: %d", w.Code)
+	}
+	if w := r.do("POST", "/api/windows/resume", map[string]string{"key": "nope"}); w.Code != 400 {
+		t.Fatalf("unknown window: %d %s", w.Code, w.Body)
+	}
+}
+
 func TestPublicEndpointsExposeNoSecrets(t *testing.T) {
 	r := newRig(t)
 	r.setup()
 	r.do("POST", "/api/auth/logout", nil)
-	for _, p := range []string{"/api/status", "/api/ping", "/api/config", "/api/events"} {
+	for _, p := range []string{"/api/status", "/api/ping", "/api/config", "/api/events", "/api/blocked"} {
 		w := r.do("GET", p, nil, func(q *http.Request) { q.Header.Del("X-FG-Token") })
 		if w.Code != 200 {
 			t.Errorf("%s: %d", p, w.Code)
